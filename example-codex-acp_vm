@@ -1,0 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+
+NODE_PATH="$HOME/.npm"
+
+agent_vm "$NODE_PATH/bin/codex-acp" "$@"

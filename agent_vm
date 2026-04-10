@@ -1,0 +1,257 @@
+#!/bin/bash
+set -euo pipefail
+
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
+HOST_GROUP_LIST_RAW="$(id -G)"
+HOST_SUPP_GROUPS=()
+if [[ -z "${HOME:-}" ]]; then
+	HOME="$(getent passwd "$HOST_UID" | cut -d: -f6)"
+fi
+if [[ -z "${USER:-}" ]]; then
+	USER="${LOGNAME:-$(id -un)}"
+fi
+if [[ -z "${LOGNAME:-}" ]]; then
+	LOGNAME="$USER"
+fi
+if [[ -z "${SHELL:-}" ]]; then
+	SHELL="$(getent passwd "$HOST_UID" | cut -d: -f7)"
+fi
+
+for group_id in $HOST_GROUP_LIST_RAW; do
+	if [[ "$group_id" != "$HOST_GID" ]]; then
+		HOST_SUPP_GROUPS+=("$group_id")
+	fi
+done
+
+WORKDIR="${SANDBOX_WORKDIR:-$PWD}"
+AGENT_HOME="${AGENT_HOME:-$HOME/.agent}"
+BIND_CONFIG_PATH="$AGENT_HOME/binds"
+MANAGEMENT_INCLUDE_ENV_VARS_DEFAULT="HOME,LOGNAME,PATH,SHELL,USER"
+MANAGEMENT_INCLUDE_ENV_VARS="${AGENT_SANDBOX_INCLUDE_ENV_VARS:-$MANAGEMENT_INCLUDE_ENV_VARS_DEFAULT}"
+MANAGEMENT_OVERRIDE_ENV_VARS="${AGENT_SANDBOX_OVERRIDE_ENV_VARS:-}"
+VM_LOG_DIR="${AGENT_VM_LOG_DIR:-$WORKDIR/.agent_vm}"
+VM_LOG_BASENAME="${AGENT_VM_LOG_BASENAME:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+VM_KRUN_LOG="$VM_LOG_DIR/$VM_LOG_BASENAME.krun.log"
+
+BWRAP_ENV_ARGS=(
+	--setenv LC_ALL en_US.UTF-8
+	--setenv LANG en_US.UTF-8
+)
+
+BWRAP_EXTRA_ARGS=()
+VM_ENV_ASSIGNMENTS=()
+VM_ETC_ARGS=()
+VM_ROOT_EXTRA_ARGS=()
+
+trim_spaces() {
+	local value="$1"
+	value="${value#"${value%%[![:space:]]*}"}"
+	value="${value%"${value##*[![:space:]]}"}"
+	printf '%s' "$value"
+}
+
+expand_home_path() {
+	local path="$1"
+
+	case "$path" in
+		"~")
+			printf '%s' "$HOME"
+			;;
+		"~/"*)
+			printf '%s/%s' "$HOME" "${path#~/}"
+			;;
+		*)
+			printf '%s' "$path"
+			;;
+	esac
+}
+
+append_setenv_arg() {
+	local name="$1"
+	local value="$2"
+
+	if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+		printf 'Ignoring invalid variable name: %s\n' "$name" >&2
+		return
+	fi
+
+	BWRAP_ENV_ARGS+=(--setenv "$name" "$value")
+	VM_ENV_ASSIGNMENTS+=("$name=$value")
+}
+
+append_ro_bind_if_exists() {
+	local source="$1"
+	local target="$2"
+
+	if [[ -e "$source" ]]; then
+		VM_ETC_ARGS+=(--ro-bind "$source" "$target")
+	fi
+}
+
+append_root_ro_bind_if_exists() {
+	local source="$1"
+	local target="$2"
+
+	if [[ -e "$source" ]]; then
+		VM_ROOT_EXTRA_ARGS+=(--ro-bind "$source" "$target")
+	fi
+}
+
+append_bind_arg_if_exists() {
+	local source="$1"
+	local target="$2"
+	local bind_type="${3:-w}"
+
+	if [[ -e "$source" ]]; then
+		case "$bind_type" in
+			r)
+				BWRAP_EXTRA_ARGS+=(--ro-bind "$source" "$target")
+				;;
+			w)
+				BWRAP_EXTRA_ARGS+=(--bind "$source" "$target")
+				;;
+		esac
+	fi
+}
+
+load_bind_config() {
+	local line
+	local line_number=0
+	local bind_type
+	local source
+	local target
+
+	[[ -f "$BIND_CONFIG_PATH" ]] || return 0
+
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		line_number=$((line_number + 1))
+		line="$(trim_spaces "$line")"
+		[[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+
+		if [[ "$line" == [rw][[:space:]]* ]]; then
+			IFS=' ' read -r bind_type source target extra <<< "$line"
+			source="$(trim_spaces "${source:-}")"
+			target="$(trim_spaces "${target:-}")"
+
+			if [[ -n "${extra:-}" || -z "$source" || -z "$target" ]]; then
+				printf 'Ignoring invalid bind entry on line %d in %s: %s\n' "$line_number" "$BIND_CONFIG_PATH" "$line" >&2
+				continue
+			fi
+		elif [[ "$line" == *:* ]]; then
+			bind_type="w"
+			source="$(trim_spaces "${line%%:*}")"
+			target="$(trim_spaces "${line#*:}")"
+
+			if [[ -z "$source" || -z "$target" ]]; then
+				printf 'Ignoring invalid bind entry on line %d in %s: %s\n' "$line_number" "$BIND_CONFIG_PATH" "$line" >&2
+				continue
+			fi
+		else
+			printf 'Ignoring invalid bind entry on line %d in %s: %s\n' "$line_number" "$BIND_CONFIG_PATH" "$line" >&2
+			continue
+		fi
+
+		source="$(expand_home_path "$source")"
+		target="$(expand_home_path "$target")"
+		append_bind_arg_if_exists "$source" "$target" "$bind_type"
+	done < "$BIND_CONFIG_PATH"
+}
+
+shell_quote_args() {
+	local quoted=()
+	local item
+
+	for item in "$@"; do
+		quoted+=("$(printf '%q' "$item")")
+	done
+
+	local IFS=' '
+	printf '%s' "${quoted[*]}"
+}
+
+if [[ -n "$MANAGEMENT_INCLUDE_ENV_VARS" ]]; then
+	IFS=',' read -r -a include_vars <<< "$MANAGEMENT_INCLUDE_ENV_VARS"
+	for var_name in "${include_vars[@]}"; do
+		var_name="$(trim_spaces "$var_name")"
+		[[ -z "$var_name" ]] && continue
+
+		if [[ -n "${!var_name+x}" ]]; then
+			append_setenv_arg "$var_name" "${!var_name}"
+		fi
+	done
+fi
+
+if [[ -n "$MANAGEMENT_OVERRIDE_ENV_VARS" ]]; then
+	IFS=',' read -r -a override_items <<< "$MANAGEMENT_OVERRIDE_ENV_VARS"
+	for item in "${override_items[@]}"; do
+		item="$(trim_spaces "$item")"
+		[[ -z "$item" ]] && continue
+
+		if [[ "$item" != *=* ]]; then
+			printf 'Ignoring invalid override (expected KEY=VALUE): %s\n' "$item" >&2
+			continue
+		fi
+
+		var_name="$(trim_spaces "${item%%=*}")"
+		var_value="${item#*=}"
+		append_setenv_arg "$var_name" "$var_value"
+	done
+fi
+
+append_ro_bind_if_exists /etc/passwd /etc/passwd
+append_ro_bind_if_exists /etc/group /etc/group
+append_ro_bind_if_exists /etc/nsswitch.conf /etc/nsswitch.conf
+append_ro_bind_if_exists /etc/hosts /etc/hosts
+append_ro_bind_if_exists /etc/resolv.conf /etc/resolv.conf
+append_ro_bind_if_exists /etc/ld.so.cache /etc/ld.so.cache
+append_ro_bind_if_exists /etc/ld.so.conf /etc/ld.so.conf
+append_ro_bind_if_exists /etc/ld.so.conf.d /etc/ld.so.conf.d
+append_ro_bind_if_exists /etc/localtime /etc/localtime
+append_ro_bind_if_exists /etc/ssl /etc/ssl
+append_ro_bind_if_exists /etc/pki /etc/pki
+append_root_ro_bind_if_exists /sys /sys
+load_bind_config
+
+mkdir -p "$VM_LOG_DIR"
+: > "$VM_KRUN_LOG"
+
+VM_COMMAND=(env -i "${VM_ENV_ASSIGNMENTS[@]}" "$@")
+printf -v VM_COMMAND_STR '%s' "$(shell_quote_args "${VM_COMMAND[@]}")"
+printf -v WORKDIR_STR '%q' "$WORKDIR"
+VM_SHELL_COMMAND="cd $WORKDIR_STR && exec $VM_COMMAND_STR"
+VM_ENTRYPOINT=(/usr/bin/setpriv --reuid "$HOST_UID" --regid "$HOST_GID")
+if ((${#HOST_SUPP_GROUPS[@]} > 0)); then
+	printf -v HOST_SUPP_GROUPS_STR '%s' "$(IFS=,; printf '%s' "${HOST_SUPP_GROUPS[*]}")"
+	VM_ENTRYPOINT+=(--groups "$HOST_SUPP_GROUPS_STR")
+else
+	VM_ENTRYPOINT+=(--clear-groups)
+fi
+VM_ENTRYPOINT+=(/bin/sh -lc "$VM_SHELL_COMMAND")
+
+bwrap \
+	--unshare-all \
+	--share-net \
+	--new-session \
+	--die-with-parent \
+	--ro-bind /usr /usr \
+	--ro-bind /bin /bin \
+	--ro-bind /lib /lib \
+	--ro-bind /lib64 /lib64 \
+	--ro-bind /opt /opt \
+	--ro-bind /usr/local /usr/local \
+	--proc /proc \
+	--dev-bind /dev /dev \
+	--dir /etc \
+	--tmpfs /tmp \
+	--bind "$WORKDIR" "$WORKDIR" \
+	--chdir "$WORKDIR" \
+	--clearenv \
+	"${BWRAP_EXTRA_ARGS[@]}" \
+	"${VM_ROOT_EXTRA_ARGS[@]}" \
+	"${VM_ETC_ARGS[@]}" \
+	"${BWRAP_ENV_ARGS[@]}" \
+	chroot_vm --log="$VM_KRUN_LOG" / "${VM_ENTRYPOINT[@]}"
+status=$?
+trap - EXIT
+exit "$status"

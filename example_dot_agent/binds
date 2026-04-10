@@ -1,0 +1,3 @@
+r /home/user/.agent/npmrc /home/user/.npmrc
+w /home/user/.agent/npm /home/user/.npm
+w /home/user/.codex /home/user/.codex
