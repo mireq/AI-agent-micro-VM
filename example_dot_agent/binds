@@ -1,3 +1,24 @@
+# System
+r /usr /usr
+r /bin /bin
+r /lib /lib
+r /lib64 /lib64
+r /opt /opt
+r /usr/local /usr/local
+r /etc/passwd /etc/passwd
+r /etc/group /etc/group
+r /etc/nsswitch.conf /etc/nsswitch.conf
+r /etc/hosts /etc/hosts
+r /etc/resolv.conf /etc/resolv.conf
+r /etc/ld.so.cache /etc/ld.so.cache
+r /etc/ld.so.conf /etc/ld.so.conf
+r /etc/ld.so.conf.d /etc/ld.so.conf.d
+r /etc/localtime /etc/localtime
+r /etc/ssl /etc/ssl
+r /etc/pki /etc/pki
+r /sys /sys
+
+# User-specific examples
 r /home/user/.agent/npmrc /home/user/.npmrc
 w /home/user/.agent/npm /home/user/.npm
 w /home/user/.codex /home/user/.codex

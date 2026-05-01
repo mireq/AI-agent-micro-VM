@@ -28,7 +28,6 @@ BWRAP_ENV_ARGS=(
 )
 
 BWRAP_EXTRA_ARGS=()
-BWRAP_BIND_ARGS=()
 
 trim_spaces() {
 	local value="$1"
@@ -64,16 +63,6 @@ append_setenv_arg() {
 
 	BWRAP_ENV_ARGS+=(--setenv "$name" "$value")
 }
-
-append_ro_bind_if_exists() {
-	local source="$1"
-	local target="$2"
-
-	if [[ -e "$source" ]]; then
-		BWRAP_BIND_ARGS+=(--ro-bind "$source" "$target")
-	fi
-}
-
 
 append_bind_arg_if_exists() {
 	local source="$1"
@@ -176,18 +165,6 @@ if [[ -n "$MANAGEMENT_OVERRIDE_ENV_VARS" ]]; then
 	done
 fi
 
-append_ro_bind_if_exists /etc/passwd /etc/passwd
-append_ro_bind_if_exists /etc/group /etc/group
-append_ro_bind_if_exists /etc/nsswitch.conf /etc/nsswitch.conf
-append_ro_bind_if_exists /etc/hosts /etc/hosts
-append_ro_bind_if_exists /etc/resolv.conf /etc/resolv.conf
-append_ro_bind_if_exists /etc/ld.so.cache /etc/ld.so.cache
-append_ro_bind_if_exists /etc/ld.so.conf /etc/ld.so.conf
-append_ro_bind_if_exists /etc/ld.so.conf.d /etc/ld.so.conf.d
-append_ro_bind_if_exists /etc/localtime /etc/localtime
-append_ro_bind_if_exists /etc/ssl /etc/ssl
-append_ro_bind_if_exists /etc/pki /etc/pki
-append_ro_bind_if_exists /sys /sys
 load_bind_config
 
 
@@ -196,12 +173,6 @@ bwrap \
 	--new-session \
 	--share-net \
 	--die-with-parent \
-	--ro-bind /usr /usr \
-	--ro-bind /bin /bin \
-	--ro-bind /lib /lib \
-	--ro-bind /lib64 /lib64 \
-	--ro-bind /opt /opt \
-	--ro-bind /usr/local /usr/local \
 	--proc /proc \
 	--dev /dev \
 	--dir /etc \
@@ -210,7 +181,6 @@ bwrap \
 	--chdir "$WORKDIR" \
 	--clearenv \
 	"${BWRAP_EXTRA_ARGS[@]}" \
-	"${BWRAP_BIND_ARGS[@]}" \
 	"${BWRAP_ENV_ARGS[@]}" \
 	"$@"
 status=$?

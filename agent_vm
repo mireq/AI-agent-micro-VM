@@ -41,8 +41,6 @@ BWRAP_ENV_ARGS=(
 
 BWRAP_EXTRA_ARGS=()
 VM_ENV_ASSIGNMENTS=()
-VM_ETC_ARGS=()
-VM_ROOT_EXTRA_ARGS=()
 
 trim_spaces() {
 	local value="$1"
@@ -78,24 +76,6 @@ append_setenv_arg() {
 
 	BWRAP_ENV_ARGS+=(--setenv "$name" "$value")
 	VM_ENV_ASSIGNMENTS+=("$name=$value")
-}
-
-append_ro_bind_if_exists() {
-	local source="$1"
-	local target="$2"
-
-	if [[ -e "$source" ]]; then
-		VM_ETC_ARGS+=(--ro-bind "$source" "$target")
-	fi
-}
-
-append_root_ro_bind_if_exists() {
-	local source="$1"
-	local target="$2"
-
-	if [[ -e "$source" ]]; then
-		VM_ROOT_EXTRA_ARGS+=(--ro-bind "$source" "$target")
-	fi
 }
 
 append_bind_arg_if_exists() {
@@ -199,18 +179,6 @@ if [[ -n "$MANAGEMENT_OVERRIDE_ENV_VARS" ]]; then
 	done
 fi
 
-append_ro_bind_if_exists /etc/passwd /etc/passwd
-append_ro_bind_if_exists /etc/group /etc/group
-append_ro_bind_if_exists /etc/nsswitch.conf /etc/nsswitch.conf
-append_ro_bind_if_exists /etc/hosts /etc/hosts
-append_ro_bind_if_exists /etc/resolv.conf /etc/resolv.conf
-append_ro_bind_if_exists /etc/ld.so.cache /etc/ld.so.cache
-append_ro_bind_if_exists /etc/ld.so.conf /etc/ld.so.conf
-append_ro_bind_if_exists /etc/ld.so.conf.d /etc/ld.so.conf.d
-append_ro_bind_if_exists /etc/localtime /etc/localtime
-append_ro_bind_if_exists /etc/ssl /etc/ssl
-append_ro_bind_if_exists /etc/pki /etc/pki
-append_root_ro_bind_if_exists /sys /sys
 load_bind_config
 
 mkdir -p "$VM_LOG_DIR"
@@ -234,12 +202,6 @@ bwrap \
 	--share-net \
 	--new-session \
 	--die-with-parent \
-	--ro-bind /usr /usr \
-	--ro-bind /bin /bin \
-	--ro-bind /lib /lib \
-	--ro-bind /lib64 /lib64 \
-	--ro-bind /opt /opt \
-	--ro-bind /usr/local /usr/local \
 	--proc /proc \
 	--dev-bind /dev /dev \
 	--dir /etc \
@@ -248,8 +210,6 @@ bwrap \
 	--chdir "$WORKDIR" \
 	--clearenv \
 	"${BWRAP_EXTRA_ARGS[@]}" \
-	"${VM_ROOT_EXTRA_ARGS[@]}" \
-	"${VM_ETC_ARGS[@]}" \
 	"${BWRAP_ENV_ARGS[@]}" \
 	chroot_vm --log="$VM_KRUN_LOG" / "${VM_ENTRYPOINT[@]}"
 status=$?

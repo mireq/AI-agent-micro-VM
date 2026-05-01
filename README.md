@@ -19,11 +19,11 @@ Both launchers use `bwrap` with:
 
 - `--unshare-all` and `--new-session`
 - host network namespace sharing (`--share-net`)
-- read-only mounts for `/usr`, `/bin`, `/lib`, `/lib64`, `/opt`, `/usr/local`
 - writable bind mount of the chosen workdir
 - `tmpfs` at `/tmp`
 - clean environment (`--clearenv`) with explicit variables re-added
-- optional user-defined bind mounts from `${AGENT_HOME:-$HOME/.agent}/binds`
+- bind mounts loaded from `${AGENT_HOME:-$HOME/.agent}/binds`
+- special built-in mounts only for `proc` and `dev`
 
 ## Requirements
 
@@ -85,6 +85,7 @@ Rules:
 - `~` expands to host home
 - missing source paths are ignored
 - malformed lines are skipped with a warning
+- non-special mounts are no longer hardcoded in launchers; provide required runtime mounts in this file
 
 See [example_dot_agent/binds](/home/mirec/AI-agent-micro-VM/example_dot_agent/binds).
 
@@ -119,7 +120,7 @@ cp example_dot_agent/binds ~/.agent/binds
 cp example_dot_agent/npmrc ~/.agent/npmrc
 ```
 
-3. Replace `/home/user/...` paths in `~/.agent/binds` and `~/.agent/npmrc` with your actual home path.
+3. Keep the runtime/system bind lines in `~/.agent/binds`
 4. Run the wrapper:
 
 ```bash
@@ -149,7 +150,7 @@ Use these logs when sandbox bootstrap succeeds but command execution fails later
 
 - Networking is shared with the caller (`--share-net`), so there is no network isolation by default.
 - Any bind-mounted path is accessible to the sandboxed process with the permissions you grant (`r`/`w`).
-- The example bind file includes a writable `.codex` mount for convenience; remove it if you do not want shared agent state/credentials.
+- The example bind file includes runtime/system binds needed by the launchers plus a writable `.codex` mount for convenience; remove the `.codex` line if you do not want shared agent state/credentials.
 
 ## Network Namespace Integration
 
