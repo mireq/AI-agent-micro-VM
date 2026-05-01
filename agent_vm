@@ -27,6 +27,7 @@ done
 WORKDIR="${SANDBOX_WORKDIR:-$PWD}"
 AGENT_HOME="${AGENT_HOME:-$HOME/.agent}"
 BIND_CONFIG_PATH="$AGENT_HOME/binds"
+EXTRA_BIND_CONFIG_PATH="${AGENT_BIND_CONFIG_EXTRA_PATH:-}"
 MANAGEMENT_INCLUDE_ENV_VARS_DEFAULT="HOME,LOGNAME,PATH,SHELL,USER"
 MANAGEMENT_INCLUDE_ENV_VARS="${AGENT_SANDBOX_INCLUDE_ENV_VARS:-$MANAGEMENT_INCLUDE_ENV_VARS_DEFAULT}"
 MANAGEMENT_OVERRIDE_ENV_VARS="${AGENT_SANDBOX_OVERRIDE_ENV_VARS:-}"
@@ -96,13 +97,14 @@ append_bind_arg_if_exists() {
 }
 
 load_bind_config() {
+	local config_path="$1"
 	local line
 	local line_number=0
 	local bind_type
 	local source
 	local target
 
-	[[ -f "$BIND_CONFIG_PATH" ]] || return 0
+	[[ -f "$config_path" ]] || return 0
 
 	while IFS= read -r line || [[ -n "$line" ]]; do
 		line_number=$((line_number + 1))
@@ -115,7 +117,7 @@ load_bind_config() {
 			target="$(trim_spaces "${target:-}")"
 
 			if [[ -n "${extra:-}" || -z "$source" || -z "$target" ]]; then
-				printf 'Ignoring invalid bind entry on line %d in %s: %s\n' "$line_number" "$BIND_CONFIG_PATH" "$line" >&2
+				printf 'Ignoring invalid bind entry on line %d in %s: %s\n' "$line_number" "$config_path" "$line" >&2
 				continue
 			fi
 		elif [[ "$line" == *:* ]]; then
@@ -124,18 +126,18 @@ load_bind_config() {
 			target="$(trim_spaces "${line#*:}")"
 
 			if [[ -z "$source" || -z "$target" ]]; then
-				printf 'Ignoring invalid bind entry on line %d in %s: %s\n' "$line_number" "$BIND_CONFIG_PATH" "$line" >&2
+				printf 'Ignoring invalid bind entry on line %d in %s: %s\n' "$line_number" "$config_path" "$line" >&2
 				continue
 			fi
 		else
-			printf 'Ignoring invalid bind entry on line %d in %s: %s\n' "$line_number" "$BIND_CONFIG_PATH" "$line" >&2
+			printf 'Ignoring invalid bind entry on line %d in %s: %s\n' "$line_number" "$config_path" "$line" >&2
 			continue
 		fi
 
 		source="$(expand_home_path "$source")"
 		target="$(expand_home_path "$target")"
 		append_bind_arg_if_exists "$source" "$target" "$bind_type"
-	done < "$BIND_CONFIG_PATH"
+	done < "$config_path"
 }
 
 shell_quote_args() {
@@ -179,7 +181,10 @@ if [[ -n "$MANAGEMENT_OVERRIDE_ENV_VARS" ]]; then
 	done
 fi
 
-load_bind_config
+load_bind_config "$BIND_CONFIG_PATH"
+if [[ -n "$EXTRA_BIND_CONFIG_PATH" ]]; then
+	load_bind_config "$(expand_home_path "$EXTRA_BIND_CONFIG_PATH")"
+fi
 
 mkdir -p "$VM_LOG_DIR"
 : > "$VM_KRUN_LOG"

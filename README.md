@@ -69,6 +69,12 @@ Both scripts read binds from:
 ${AGENT_HOME:-$HOME/.agent}/binds
 ```
 
+Optional extra bind file:
+
+```text
+${AGENT_BIND_CONFIG_EXTRA_PATH}
+```
+
 Supported entries:
 
 ```text
@@ -86,6 +92,7 @@ Rules:
 - missing source paths are ignored
 - malformed lines are skipped with a warning
 - non-special mounts are no longer hardcoded in launchers; provide required runtime mounts in this file
+- if `AGENT_BIND_CONFIG_EXTRA_PATH` is set, that file loads after default binds and entries are additive
 
 See [example_dot_agent/binds](/home/mirec/AI-agent-micro-VM/example_dot_agent/binds).
 
@@ -93,6 +100,7 @@ See [example_dot_agent/binds](/home/mirec/AI-agent-micro-VM/example_dot_agent/bi
 
 - `SANDBOX_WORKDIR`: mounted project directory and initial cwd inside sandbox
 - `AGENT_HOME`: location of `binds` file (default `$HOME/.agent`)
+- `AGENT_BIND_CONFIG_EXTRA_PATH`: optional extra binds file loaded in addition to `$AGENT_HOME/binds`
 - `AGENT_SANDBOX_INCLUDE_ENV_VARS`: comma-separated vars copied in (default `HOME,LOGNAME,PATH,SHELL,USER`)
 - `AGENT_SANDBOX_OVERRIDE_ENV_VARS`: comma-separated `KEY=VALUE` pairs injected in sandbox
 
