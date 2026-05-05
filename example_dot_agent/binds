@@ -16,6 +16,7 @@ r /etc/ld.so.conf.d /etc/ld.so.conf.d
 r /etc/localtime /etc/localtime
 r /etc/ssl /etc/ssl
 r /etc/pki /etc/pki
+r /etc/man_db.conf /etc/man_db.conf
 r /sys /sys
 
 # User-specific examples
