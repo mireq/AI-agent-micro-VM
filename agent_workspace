@@ -345,6 +345,27 @@ def configured_network(context: CommandContext, isolated: bool = True, verbose: 
 	return NetworkConfig(isolated=isolated, verbose=verbose, forwards=parse_net_forwards(config, str(context.config_path)))
 
 
+def stringify_env_value(value: object, key: str, source_name: str) -> str:
+	if isinstance(value, bool):
+		return '1' if value else '0'
+	if isinstance(value, (str, int, float)):
+		return str(value)
+
+	raise CommandError(f"{source_name}: env.{key} must be a string, number, or boolean", return_code=2)
+
+
+def configured_env(context: CommandContext) -> dict[str, str]:
+	config = read_toml_file(context.config_path)
+	source_name = str(context.config_path)
+	raw_env = config.get('env', {})
+	if raw_env is None:
+		return {}
+	if not isinstance(raw_env, dict):
+		raise CommandError(f"{source_name}: 'env' must be a table", return_code=2)
+
+	return {str(key): stringify_env_value(value, str(key), source_name) for key, value in raw_env.items()}
+
+
 def root_dir(workspace: Path) -> Path:
 	return workspace / 'root'
 
@@ -540,6 +561,8 @@ def bwrap_command(
 	for env_name in ('HOME', 'USER', 'LOGNAME', 'SHELL', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM'):
 		if env_name in os.environ:
 			env_args.extend(['--setenv', env_name, os.environ[env_name]])
+	for env_name, env_value in configured_env(context).items():
+		env_args.extend(['--setenv', env_name, env_value])
 	args.extend(
 		[
 			*bwrap_mount_args(context, workspace),
