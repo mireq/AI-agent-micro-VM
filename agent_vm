@@ -211,11 +211,11 @@ bwrap \
 	--dev-bind /dev /dev \
 	--dir /etc \
 	--tmpfs /tmp \
-	--bind "$WORKDIR" "$WORKDIR" \
-	--chdir "$WORKDIR" \
 	--clearenv \
 	"${BWRAP_EXTRA_ARGS[@]}" \
 	"${BWRAP_ENV_ARGS[@]}" \
+	--bind "$WORKDIR" "$WORKDIR" \
+	--chdir "$WORKDIR" \
 	chroot_vm --log="$VM_KRUN_LOG" / "${VM_ENTRYPOINT[@]}"
 status=$?
 trap - EXIT
