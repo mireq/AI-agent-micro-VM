@@ -2,12 +2,14 @@
 import argparse
 import dataclasses
 import hashlib
+import json
 import os
 import pwd
 import re
 import shlex
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -101,6 +103,8 @@ dst = "/etc/man_db.conf"
 DEFAULT_SCRIPT = '#!/usr/bin/env bash\n'
 WORKSPACE_SEPARATOR = '__'
 VALID_MOUNT_FLAGS = frozenset(('r', 'w', 'o'))
+DEFAULT_NET_PROTOCOL = 'tcp'
+VALID_NET_ALLOW_RULES = frozenset(('host_connect_sandbox', 'sandbox_connect_host'))
 WORKSPACE_SCRIPTS = (
 	'workspace_post_create',
 	'workspace_pre_enter',
@@ -135,6 +139,21 @@ class MountSpec:
 	flag: str
 	src: Path
 	dst: Path
+
+
+@dataclasses.dataclass(frozen=True)
+class NetForward:
+	allow: str
+	protocol: str
+	host_port: int
+	sandbox_port: int
+
+
+@dataclasses.dataclass(frozen=True)
+class NetworkConfig:
+	isolated: bool
+	verbose: bool
+	forwards: list[NetForward]
 
 
 def default_workdir() -> Path:
@@ -194,10 +213,13 @@ def ensure_workspace_config(workdir: Path) -> tuple[Path, Path, Path]:
 	agent_config = ensure_agent_config()
 	workspace_path = workspace_dir(workdir)
 	config_path = workspace_path / 'config.toml'
+	path_file = workspace_path / '.path'
 	workspace_path.mkdir(parents=True, exist_ok=True)
 
 	if not config_path.exists():
 		config_path.write_text(DEFAULT_WORKDIR_CONFIG, encoding='utf-8')
+	if not path_file.exists():
+		path_file.write_text(f'{workdir}\n', encoding='utf-8')
 
 	initialize_workspace_scripts(workspace_path)
 
@@ -275,6 +297,54 @@ def remove_duplicate_mounts(mounts: list[MountSpec]) -> list[MountSpec]:
 	return result
 
 
+def parse_port(value: object, field_name: str, source_name: str, index: int) -> int:
+	if not isinstance(value, int):
+		raise CommandError(f"{source_name}: net #{index} {field_name} must be an integer", return_code=2)
+	if value < 1 or value > 65535:
+		raise CommandError(f"{source_name}: net #{index} {field_name} must be between 1 and 65535", return_code=2)
+
+	return value
+
+
+def parse_net_forwards(config: dict, source_name: str) -> list[NetForward]:
+	raw_forwards = config.get('net', [])
+	if raw_forwards is None:
+		return []
+	if not isinstance(raw_forwards, list):
+		raise CommandError(f"{source_name}: 'net' must be an array", return_code=2)
+
+	forwards = []
+	for index, raw_forward in enumerate(raw_forwards, start=1):
+		if not isinstance(raw_forward, dict):
+			raise CommandError(f"{source_name}: net #{index} must be a table", return_code=2)
+
+		allow = raw_forward.get('allow')
+		protocol = raw_forward.get('protocol', DEFAULT_NET_PROTOCOL)
+		if allow not in VALID_NET_ALLOW_RULES:
+			raise CommandError(
+				f"{source_name}: net #{index} allow must be host_connect_sandbox or sandbox_connect_host",
+				return_code=2,
+			)
+		if protocol != 'tcp':
+			raise CommandError(f"{source_name}: net #{index} protocol must be tcp", return_code=2)
+
+		forwards.append(
+			NetForward(
+				allow=allow,
+				protocol=protocol,
+				host_port=parse_port(raw_forward.get('host_port'), 'host_port', source_name, index),
+				sandbox_port=parse_port(raw_forward.get('sandbox_port'), 'sandbox_port', source_name, index),
+			)
+		)
+
+	return forwards
+
+
+def configured_network(context: CommandContext, isolated: bool = True, verbose: bool = False) -> NetworkConfig:
+	config = read_toml_file(context.config_path)
+	return NetworkConfig(isolated=isolated, verbose=verbose, forwards=parse_net_forwards(config, str(context.config_path)))
+
+
 def root_dir(workspace: Path) -> Path:
 	return workspace / 'root'
 
@@ -304,35 +374,11 @@ def is_mounted(path: Path) -> bool:
 		return False
 
 
-def create_mount_target(src: Path, target: Path) -> None:
-	target.parent.mkdir(parents=True, exist_ok=True)
-	if src.is_dir():
-		target.mkdir(parents=True, exist_ok=True)
-	else:
-		target.touch(exist_ok=True)
-
-
 def run_mount_command(command: list[str], description: str) -> None:
 	result = subprocess.run(command, check=False, stderr=subprocess.PIPE, text=True)
 	if result.returncode != 0:
 		message = result.stderr.strip() or f"{description} failed with exit code {result.returncode}"
 		raise CommandError(message, return_code=result.returncode)
-
-
-def mount_bindfs(src: Path, target: Path, read_only: bool) -> None:
-	if not src.exists():
-		return
-
-	create_mount_target(src, target)
-	if is_mounted(target):
-		return
-
-	command = ['bindfs']
-	if read_only:
-		command.append('-r')
-	command.extend([str(src), str(target)])
-
-	run_mount_command(command, f"bindfs mount {src} at {target}")
 
 
 def mount_overlay(workspace: Path, mount: MountSpec) -> None:
@@ -371,10 +417,26 @@ def prepare_workspace_root(context: CommandContext, workspace: Path) -> Path:
 	for mount in configured_mounts(context):
 		if mount.flag == 'o':
 			mount_overlay(workspace, mount)
-		else:
-			mount_bindfs(mount.src, root_target(workspace, mount.dst), mount.flag == 'r')
 
 	return root
+
+
+def bwrap_mount_args(context: CommandContext, workspace: Path) -> list[str]:
+	entries = []
+	for mount in configured_mounts(context):
+		if mount.flag == 'o':
+			src = root_target(workspace, mount.dst)
+			if src.exists():
+				entries.append(('--bind', src, mount.dst))
+		elif mount.src.exists():
+			bind_flag = '--ro-bind' if mount.flag == 'r' else '--bind'
+			entries.append((bind_flag, mount.src, mount.dst))
+
+	latest_by_dst = {dst: (flag, src, dst) for flag, src, dst in entries}
+	args = []
+	for flag, src, dst in latest_by_dst.values():
+		args.extend([flag, str(src), str(dst)])
+	return args
 
 
 def run_pre_enter(context: CommandContext, workspace: Path, branch: str) -> None:
@@ -448,20 +510,28 @@ def enter_workspace_command(final_dir: Path, branch: str, command: list[str]) ->
 	raise AssertionError("os.execvpe returned unexpectedly")
 
 
-def enter_bwrap_command(root: Path, workdir: Path, branch: str, command: list[str]) -> int:
+def bwrap_command(
+	context: CommandContext,
+	workspace: Path,
+	workdir: Path,
+	branch: str,
+	command: list[str],
+	network: NetworkConfig,
+	extra_options: list[str] | None = None,
+) -> list[str]:
 	if not command:
 		raise CommandError("command must not be empty", return_code=2)
 
-	os.execvpe(
+	args = [
 		'bwrap',
+		'--unshare-all',
+		'--die-with-parent',
+	]
+	if not network.isolated:
+		args.append('--share-net')
+	args.extend(
 		[
-			'bwrap',
-			'--unshare-all',
-			'--share-net',
-			'--die-with-parent',
-			'--bind',
-			str(root),
-			'/',
+			*bwrap_mount_args(context, workspace),
 			'--proc',
 			'/proc',
 			'--dev',
@@ -474,11 +544,159 @@ def enter_bwrap_command(root: Path, workdir: Path, branch: str, command: list[st
 			'--setenv',
 			'PWD',
 			str(workdir),
+			*(extra_options or []),
+			'--',
 			*command,
-		],
-		os.environ.copy(),
+		]
 	)
+	return args
+
+
+def enter_bwrap_command(
+	context: CommandContext,
+	workspace: Path,
+	workdir: Path,
+	branch: str,
+	command: list[str],
+	network: NetworkConfig,
+) -> int:
+	if network.isolated:
+		return run_isolated_bwrap(context, workspace, workdir, branch, command, network)
+
+	os.execvpe('bwrap', bwrap_command(context, workspace, workdir, branch, command, network), os.environ.copy())
 	raise AssertionError("os.execvpe returned unexpectedly")
+
+
+def read_bwrap_child_pid(status_fd: int) -> int:
+	status_file = os.fdopen(status_fd, 'r', encoding='utf-8')
+	with status_file:
+		for line in status_file:
+			status = json.loads(line)
+			child_pid = status.get('child-pid')
+			if child_pid is not None:
+				return child_pid
+
+	raise CommandError("bwrap did not report child pid", return_code=1)
+
+
+def pasta_port_spec(forward: NetForward) -> str:
+	if forward.allow == 'host_connect_sandbox':
+		return f'{forward.host_port}:{forward.sandbox_port}'
+
+	return f'{forward.sandbox_port}:{forward.host_port}'
+
+
+def pasta_command(child_pid: int, network: NetworkConfig) -> list[str]:
+	host_connect_sandbox = [forward for forward in network.forwards if forward.allow == 'host_connect_sandbox']
+	sandbox_connect_host = [forward for forward in network.forwards if forward.allow == 'sandbox_connect_host']
+	command = [
+		'pasta',
+		'--foreground',
+		'--config-net',
+		'--no-map-gw',
+		'--udp-ports',
+		'none',
+		'--udp-ns',
+		'none',
+		'--host-lo-to-ns-lo',
+	]
+	if not network.verbose:
+		command.append('--quiet')
+
+	if host_connect_sandbox:
+		for forward in host_connect_sandbox:
+			command.extend(['--tcp-ports', pasta_port_spec(forward)])
+	else:
+		command.extend(['--tcp-ports', 'none'])
+
+	if sandbox_connect_host:
+		for forward in sandbox_connect_host:
+			command.extend(['--tcp-ns', pasta_port_spec(forward)])
+	else:
+		command.extend(['--tcp-ns', 'none'])
+
+	command.append(str(child_pid))
+	return command
+
+
+def start_pasta(child_pid: int, network: NetworkConfig) -> subprocess.Popen:
+	return subprocess.Popen(
+		pasta_command(child_pid, network),
+		close_fds=True,
+		stdout=None if network.verbose else subprocess.DEVNULL,
+		stderr=None if network.verbose else subprocess.PIPE,
+	)
+
+
+def wait_for_pasta_start(pasta: subprocess.Popen) -> None:
+	time.sleep(0.25)
+	if pasta.poll() is None:
+		return
+
+	message = "pasta network setup failed"
+	if pasta.stderr is not None:
+		stderr = pasta.stderr.read().decode('utf-8', errors='replace').strip()
+		if stderr:
+			message = stderr
+
+	raise CommandError(message, return_code=pasta.returncode or 1)
+
+
+def run_isolated_bwrap(
+	context: CommandContext,
+	workspace: Path,
+	workdir: Path,
+	branch: str,
+	command: list[str],
+	network: NetworkConfig,
+) -> int:
+	status_read_fd, status_write_fd = os.pipe()
+	block_read_fd, block_write_fd = os.pipe()
+	bwrap_args = bwrap_command(
+		context,
+		workspace,
+		workdir,
+		branch,
+		command,
+		network,
+		extra_options=[
+			'--json-status-fd',
+			str(status_write_fd),
+			'--block-fd',
+			str(block_read_fd),
+		],
+	)
+	bwrap = subprocess.Popen(
+		bwrap_args,
+		pass_fds=(status_write_fd, block_read_fd),
+		close_fds=True,
+	)
+	os.close(status_write_fd)
+	os.close(block_read_fd)
+
+	pasta = None
+	try:
+		child_pid = read_bwrap_child_pid(status_read_fd)
+		pasta = start_pasta(child_pid, network)
+		wait_for_pasta_start(pasta)
+		os.close(block_write_fd)
+		block_write_fd = None
+		return bwrap.wait()
+	except Exception:
+		bwrap.terminate()
+		try:
+			bwrap.wait(timeout=5)
+		except subprocess.TimeoutExpired:
+			bwrap.kill()
+		raise
+	finally:
+		if block_write_fd is not None:
+			os.close(block_write_fd)
+		if pasta is not None:
+			try:
+				pasta.wait(timeout=5)
+			except subprocess.TimeoutExpired:
+				pasta.terminate()
 
 
 def command_configure(context: CommandContext) -> int:
@@ -526,9 +744,16 @@ def command_cd(context: CommandContext) -> int:
 def command_shell(context: CommandContext) -> int:
 	branch = current_branch(context)
 	workspace = ensure_workspace(context, branch)
-	root = prepare_workspace_root(context, workspace)
+	prepare_workspace_root(context, workspace)
 	run_pre_enter(context, workspace, branch)
-	return enter_bwrap_command(root, context.workdir, branch, get_shell_command())
+	return enter_bwrap_command(
+		context,
+		workspace,
+		context.workdir,
+		branch,
+		get_shell_command(),
+		configured_network(context, isolated=not context.args.shared_network, verbose=context.args.verbose),
+	)
 
 
 def command_subagent(context: CommandContext) -> int:
@@ -538,9 +763,9 @@ def command_subagent(context: CommandContext) -> int:
 
 	branch = subagent_branch(current_branch(context), context.args.name)
 	workspace = ensure_workspace(context, branch)
-	root = prepare_workspace_root(context, workspace)
+	prepare_workspace_root(context, workspace)
 	run_pre_enter(context, workspace, branch)
-	return enter_bwrap_command(root, context.workdir, branch, command)
+	return enter_bwrap_command(context, workspace, context.workdir, branch, command, configured_network(context))
 
 
 COMMAND_TABLE = {
@@ -574,9 +799,19 @@ def build_parser() -> argparse.ArgumentParser:
 		"cd",
 		help="Create or select the configured workspace and start a host shell in root/<workdir>.",
 	)
-	subparsers.add_parser(
+	shell_parser = subparsers.add_parser(
 		"shell",
 		help="Create or select the configured workspace and start a bwrap shell.",
+	)
+	shell_parser.add_argument(
+		'--shared-network',
+		action='store_true',
+		help="Share host networking instead of using isolated networking.",
+	)
+	shell_parser.add_argument(
+		'--verbose',
+		action='store_true',
+		help="Print isolated network setup details.",
 	)
 	subagent_parser = subparsers.add_parser(
 		"subagent",
