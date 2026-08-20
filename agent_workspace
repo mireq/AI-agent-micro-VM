@@ -401,6 +401,19 @@ def open_editor(path: Path) -> int:
 	return subprocess.call([*command, str(path)])
 
 
+def write_toml_file(path: Path, config: dict) -> None:
+	import tomli_w
+
+	path.write_text(tomli_w.dumps(config), encoding="utf-8")
+
+
+def update_config_value(path: Path, key: str, value: str) -> None:
+	config = read_toml_file(path)
+	config[key] = value
+	write_toml_file(path, config)
+	read_toml_file(path)
+
+
 def get_shell_command() -> list[str]:
 	configured_shell = os.environ.get("SHELL")
 	if configured_shell:
@@ -465,7 +478,13 @@ def enter_bwrap_command(root: Path, workdir: Path, branch: str, command: list[st
 
 
 def command_configure(context: CommandContext) -> int:
-	return open_editor(context.config_path)
+	if context.args.var is None and context.args.value is None:
+		return open_editor(context.config_path)
+	if context.args.var is None or context.args.value is None:
+		raise CommandError("configure requires both var and value", return_code=2)
+
+	update_config_value(context.config_path, context.args.var, context.args.value)
+	return 0
 
 
 def configured_branch(config: dict) -> str:
@@ -541,10 +560,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 	subparsers = parser.add_subparsers(dest="command", required=True)
 
-	subparsers.add_parser(
+	configure_parser = subparsers.add_parser(
 		"configure",
-		help="Open this workdir's config.toml in $VISUAL or $EDITOR.",
+		help="Open or update this workdir's config.toml.",
 	)
+	configure_parser.add_argument("var", nargs="?", help="Config variable to set.")
+	configure_parser.add_argument("value", nargs="?", help="Config value to set.")
 	subparsers.add_parser(
 		"cd",
 		help="Create or select the configured workspace and start a host shell in root/<workdir>.",
