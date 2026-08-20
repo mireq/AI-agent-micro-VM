@@ -4,6 +4,7 @@ import dataclasses
 import hashlib
 import os
 import pwd
+import re
 import shlex
 import subprocess
 import sys
@@ -11,9 +12,95 @@ import tomllib
 from pathlib import Path
 
 
-DEFAULT_CONFIG = 'branch = "main"\n'
+DEFAULT_WORKDIR_CONFIG = 'branch = "main"\n'
+DEFAULT_AGENT_CONFIG = """[[mount]]
+flag = "r"
+src = "/usr"
+dst = "/usr"
+
+[[mount]]
+flag = "r"
+src = "/bin"
+dst = "/bin"
+
+[[mount]]
+flag = "r"
+src = "/lib"
+dst = "/lib"
+
+[[mount]]
+flag = "r"
+src = "/lib64"
+dst = "/lib64"
+
+[[mount]]
+flag = "r"
+src = "/opt"
+dst = "/opt"
+
+[[mount]]
+flag = "r"
+src = "/etc/passwd"
+dst = "/etc/passwd"
+
+[[mount]]
+flag = "r"
+src = "/etc/group"
+dst = "/etc/group"
+
+[[mount]]
+flag = "r"
+src = "/etc/nsswitch.conf"
+dst = "/etc/nsswitch.conf"
+
+[[mount]]
+flag = "r"
+src = "/etc/hosts"
+dst = "/etc/hosts"
+
+[[mount]]
+flag = "r"
+src = "/etc/resolv.conf"
+dst = "/etc/resolv.conf"
+
+[[mount]]
+flag = "r"
+src = "/etc/ld.so.cache"
+dst = "/etc/ld.so.cache"
+
+[[mount]]
+flag = "r"
+src = "/etc/ld.so.conf"
+dst = "/etc/ld.so.conf"
+
+[[mount]]
+flag = "r"
+src = "/etc/ld.so.conf.d"
+dst = "/etc/ld.so.conf.d"
+
+[[mount]]
+flag = "r"
+src = "/etc/localtime"
+dst = "/etc/localtime"
+
+[[mount]]
+flag = "r"
+src = "/etc/ssl"
+dst = "/etc/ssl"
+
+[[mount]]
+flag = "r"
+src = "/etc/pki"
+dst = "/etc/pki"
+
+[[mount]]
+flag = "r"
+src = "/etc/man_db.conf"
+dst = "/etc/man_db.conf"
+"""
 DEFAULT_SCRIPT = "#!/usr/bin/env bash\n"
 WORKSPACE_SEPARATOR = "__"
+VALID_MOUNT_FLAGS = frozenset(("r", "w", "o"))
 WORKSPACE_SCRIPTS = (
 	"workspace_post_create",
 	"workspace_pre_enter",
@@ -32,6 +119,14 @@ class CommandContext:
 	workdir: Path
 	workspace_path: Path
 	config_path: Path
+	agent_config_path: Path
+
+
+@dataclasses.dataclass(frozen=True)
+class MountSpec:
+	flag: str
+	src: Path
+	dst: Path
 
 
 def default_workdir() -> Path:
@@ -44,6 +139,10 @@ def resolve_workdir(workdir: str) -> Path:
 
 def agent_home() -> Path:
 	return Path(os.environ.get("AGENT_HOME", "~/.agent")).expanduser()
+
+
+def agent_config_path() -> Path:
+	return agent_home() / "config.toml"
 
 
 def workdir_hash(workdir: Path) -> str:
@@ -73,21 +172,36 @@ def read_toml_file(path: Path) -> dict:
 		raise CommandError(f"failed to parse {path}: {exc}", return_code=2) from exc
 
 
-def ensure_workspace_config(workdir: Path) -> tuple[Path, Path]:
+def ensure_agent_config() -> Path:
+	config_path = agent_config_path()
+	config_path.parent.mkdir(parents=True, exist_ok=True)
+
+	if not config_path.exists():
+		config_path.write_text(DEFAULT_AGENT_CONFIG, encoding="utf-8")
+
+	return config_path
+
+
+def ensure_workspace_config(workdir: Path) -> tuple[Path, Path, Path]:
+	agent_config = ensure_agent_config()
 	workspace_path = workspace_dir(workdir)
 	config_path = workspace_path / "config.toml"
 	workspace_path.mkdir(parents=True, exist_ok=True)
 
 	if not config_path.exists():
-		config_path.write_text(DEFAULT_CONFIG, encoding="utf-8")
+		config_path.write_text(DEFAULT_WORKDIR_CONFIG, encoding="utf-8")
 
 	initialize_workspace_scripts(workspace_path)
 
-	return workspace_path, config_path
+	return workspace_path, config_path, agent_config
 
 
 def post_create_script(workspace_path: Path) -> Path:
 	return workspace_path / "scripts" / "workspace_post_create"
+
+
+def pre_enter_script(workspace_path: Path) -> Path:
+	return workspace_path / "scripts" / "workspace_pre_enter"
 
 
 def ensure_workspace(context: CommandContext, name: str) -> Path:
@@ -107,6 +221,168 @@ def ensure_workspace(context: CommandContext, name: str) -> Path:
 			)
 
 	return final_dir
+
+
+def parse_mounts(config: dict, source_name: str) -> list[MountSpec]:
+	raw_mounts = config.get("mount", [])
+	if raw_mounts is None:
+		return []
+	if not isinstance(raw_mounts, list):
+		raise CommandError(f"{source_name}: 'mount' must be an array", return_code=2)
+
+	mounts = []
+	for index, raw_mount in enumerate(raw_mounts, start=1):
+		if not isinstance(raw_mount, dict):
+			raise CommandError(f"{source_name}: mount #{index} must be a table", return_code=2)
+
+		flag = raw_mount.get("flag")
+		src = raw_mount.get("src")
+		dst = raw_mount.get("dst")
+		if flag not in VALID_MOUNT_FLAGS:
+			raise CommandError(f"{source_name}: mount #{index} has invalid flag: {flag!r}", return_code=2)
+		if not isinstance(src, str) or not src:
+			raise CommandError(f"{source_name}: mount #{index} src must be a non-empty string", return_code=2)
+		if not isinstance(dst, str) or not dst.startswith("/"):
+			raise CommandError(f"{source_name}: mount #{index} dst must be an absolute path", return_code=2)
+		if not src.startswith("/"):
+			raise CommandError(f"{source_name}: mount #{index} src must be an absolute path", return_code=2)
+
+		mounts.append(MountSpec(flag=flag, src=Path(src).expanduser(), dst=Path(os.path.normpath(dst))))
+
+	return mounts
+
+
+def configured_mounts(context: CommandContext) -> list[MountSpec]:
+	mounts = parse_mounts(read_toml_file(context.agent_config_path), str(context.agent_config_path))
+	mounts.extend(parse_mounts(read_toml_file(context.config_path), str(context.config_path)))
+	mounts.append(MountSpec(flag="o", src=context.workdir, dst=context.workdir))
+	return remove_duplicate_mounts(mounts)
+
+
+def remove_duplicate_mounts(mounts: list[MountSpec]) -> list[MountSpec]:
+	seen_destinations = set()
+	result = []
+	for mount in mounts:
+		if mount.dst in seen_destinations:
+			continue
+		seen_destinations.add(mount.dst)
+		result.append(mount)
+
+	return result
+
+
+def root_dir(workspace: Path) -> Path:
+	return workspace / "root"
+
+
+def overlay_dir(workspace: Path, mount_dst: Path) -> Path:
+	relative_dst = mount_dst.relative_to("/")
+	if str(relative_dst) == ".":
+		relative_dst = Path("__root__")
+
+	return workspace / "overlay" / relative_dst
+
+
+def root_target(workspace: Path, mount_dst: Path) -> Path:
+	return root_dir(workspace) / mount_dst.relative_to("/")
+
+
+def decode_mountinfo_path(value: str) -> str:
+	return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
+
+
+def is_mounted(path: Path) -> bool:
+	target = str(path)
+	try:
+		with Path("/proc/self/mountinfo").open("r", encoding="utf-8") as file:
+			return any(decode_mountinfo_path(line.split()[4]) == target for line in file)
+	except OSError:
+		return False
+
+
+def create_mount_target(src: Path, target: Path) -> None:
+	target.parent.mkdir(parents=True, exist_ok=True)
+	if src.is_dir():
+		target.mkdir(parents=True, exist_ok=True)
+	else:
+		target.touch(exist_ok=True)
+
+
+def run_mount_command(command: list[str], description: str) -> None:
+	result = subprocess.run(command, check=False, stderr=subprocess.PIPE, text=True)
+	if result.returncode != 0:
+		message = result.stderr.strip() or f"{description} failed with exit code {result.returncode}"
+		raise CommandError(message, return_code=result.returncode)
+
+
+def mount_bindfs(src: Path, target: Path, read_only: bool) -> None:
+	if not src.exists():
+		return
+
+	create_mount_target(src, target)
+	if is_mounted(target):
+		return
+
+	command = ["bindfs"]
+	if read_only:
+		command.append("-r")
+	command.extend([str(src), str(target)])
+
+	run_mount_command(command, f"bindfs mount {src} at {target}")
+
+
+def mount_overlay(workspace: Path, mount: MountSpec) -> None:
+	src = mount.src.resolve(strict=False)
+	if not src.exists():
+		return
+	if not src.is_dir():
+		raise CommandError(f"overlay source must be a directory: {src}", return_code=2)
+
+	target = root_target(workspace, mount.dst)
+	target.mkdir(parents=True, exist_ok=True)
+	if is_mounted(target):
+		return
+
+	state_dir = overlay_dir(workspace, mount.dst)
+	upper_dir = state_dir / "upper"
+	work_dir = state_dir / "work"
+	upper_dir.mkdir(parents=True, exist_ok=True)
+	work_dir.mkdir(parents=True, exist_ok=True)
+
+	run_mount_command(
+		[
+			"fuse-overlayfs",
+			"-o",
+			f"lowerdir={src},upperdir={upper_dir},workdir={work_dir}",
+			str(target),
+		],
+		f"overlay mount {src} at {target}",
+	)
+
+
+def prepare_workspace_root(context: CommandContext, workspace: Path) -> Path:
+	root = root_dir(workspace)
+	root.mkdir(parents=True, exist_ok=True)
+
+	for mount in configured_mounts(context):
+		if mount.flag == "o":
+			mount_overlay(workspace, mount)
+		else:
+			mount_bindfs(mount.src, root_target(workspace, mount.dst), mount.flag == "r")
+
+	return root
+
+
+def run_pre_enter(context: CommandContext, workspace: Path, branch: str) -> None:
+	result = subprocess.run(
+		[str(pre_enter_script(context.workspace_path)), str(workspace), branch],
+		check=False,
+	)
+	if result.returncode != 0:
+		raise CommandError(
+			f"workspace_pre_enter failed with exit code {result.returncode}",
+			return_code=result.returncode,
+		)
 
 
 def get_editor_command() -> list[str] | None:
@@ -155,6 +431,39 @@ def enter_workspace_command(final_dir: Path, branch: str, command: list[str]) ->
 	raise AssertionError("os.execvpe returned unexpectedly")
 
 
+def enter_bwrap_command(root: Path, workdir: Path, branch: str, command: list[str]) -> int:
+	if not command:
+		raise CommandError("command must not be empty", return_code=2)
+
+	os.execvpe(
+		"bwrap",
+		[
+			"bwrap",
+			"--unshare-all",
+			"--share-net",
+			"--die-with-parent",
+			"--bind",
+			str(root),
+			"/",
+			"--proc",
+			"/proc",
+			"--dev",
+			"/dev",
+			"--chdir",
+			str(workdir),
+			"--setenv",
+			"AGENT_BRANCH",
+			branch,
+			"--setenv",
+			"PWD",
+			str(workdir),
+			*command,
+		],
+		os.environ.copy(),
+	)
+	raise AssertionError("os.execvpe returned unexpectedly")
+
+
 def command_configure(context: CommandContext) -> int:
 	return open_editor(context.config_path)
 
@@ -185,23 +494,36 @@ def subagent_branch(branch: str, name: str) -> str:
 
 def command_cd(context: CommandContext) -> int:
 	branch = current_branch(context)
-	final_dir = ensure_workspace(context, branch)
-	return enter_workspace_shell(final_dir, branch)
+	workspace = ensure_workspace(context, branch)
+	prepare_workspace_root(context, workspace)
+	run_pre_enter(context, workspace, branch)
+	return enter_workspace_shell(root_target(workspace, context.workdir), branch)
+
+
+def command_shell(context: CommandContext) -> int:
+	branch = current_branch(context)
+	workspace = ensure_workspace(context, branch)
+	root = prepare_workspace_root(context, workspace)
+	run_pre_enter(context, workspace, branch)
+	return enter_bwrap_command(root, context.workdir, branch, get_shell_command())
 
 
 def command_subagent(context: CommandContext) -> int:
-	branch = subagent_branch(current_branch(context), context.args.name)
-	final_dir = ensure_workspace(context, branch)
 	command = context.args.exec_command
 	if not command:
 		raise CommandError("subagent command is required", return_code=2)
 
-	return enter_workspace_command(final_dir, branch, command)
+	branch = subagent_branch(current_branch(context), context.args.name)
+	workspace = ensure_workspace(context, branch)
+	root = prepare_workspace_root(context, workspace)
+	run_pre_enter(context, workspace, branch)
+	return enter_bwrap_command(root, context.workdir, branch, command)
 
 
 COMMAND_TABLE = {
 	"configure": command_configure,
 	"cd": command_cd,
+	"shell": command_shell,
 	"subagent": command_subagent,
 }
 
@@ -225,7 +547,11 @@ def build_parser() -> argparse.ArgumentParser:
 	)
 	subparsers.add_parser(
 		"cd",
-		help="Create or select the configured workspace and start a shell there.",
+		help="Create or select the configured workspace and start a host shell in root/<workdir>.",
+	)
+	subparsers.add_parser(
+		"shell",
+		help="Create or select the configured workspace and start a bwrap shell.",
 	)
 	subagent_parser = subparsers.add_parser(
 		"subagent",
@@ -240,12 +566,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
 	args = build_parser().parse_args(argv)
 	workdir = resolve_workdir(args.workdir)
-	workspace_path, config_path = ensure_workspace_config(workdir)
+	workspace_path, config_path, agent_config = ensure_workspace_config(workdir)
 	context = CommandContext(
 		args=args,
 		workdir=workdir,
 		workspace_path=workspace_path,
 		config_path=config_path,
+		agent_config_path=agent_config,
 	)
 
 	command = COMMAND_TABLE[args.command]
