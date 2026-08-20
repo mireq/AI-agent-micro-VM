@@ -701,11 +701,16 @@ def enter_bwrap_command(
 	branch: str,
 	command: list[str],
 	network: NetworkConfig,
+	extra_options: list[str] | None = None,
 ) -> int:
 	if network.isolated:
-		return run_isolated_bwrap(context, workspace, workdir, branch, command, network)
+		return run_isolated_bwrap(context, workspace, workdir, branch, command, network, extra_options=extra_options)
 
-	os.execvpe('bwrap', bwrap_command(context, workspace, workdir, branch, command, network), os.environ.copy())
+	os.execvpe(
+		'bwrap',
+		bwrap_command(context, workspace, workdir, branch, command, network, extra_options=extra_options),
+		os.environ.copy(),
+	)
 	raise AssertionError("os.execvpe returned unexpectedly")
 
 
@@ -791,6 +796,7 @@ def run_isolated_bwrap(
 	branch: str,
 	command: list[str],
 	network: NetworkConfig,
+	extra_options: list[str] | None = None,
 ) -> int:
 	status_read_fd, status_write_fd = os.pipe()
 	block_read_fd, block_write_fd = os.pipe()
@@ -802,6 +808,7 @@ def run_isolated_bwrap(
 		command,
 		network,
 		extra_options=[
+			*(extra_options or []),
 			'--json-status-fd',
 			str(status_write_fd),
 			'--block-fd',
@@ -848,6 +855,11 @@ def command_configure(context: CommandContext) -> int:
 		raise CommandError("configure requires both var and value", return_code=2)
 
 	update_config_value(context.config_path, context.args.var, context.args.value)
+	return 0
+
+
+def command_branch(context: CommandContext) -> int:
+	update_config_value(context.config_path, 'branch', context.args.name)
 	return 0
 
 
@@ -994,6 +1006,7 @@ def command_ls(context: CommandContext) -> int:
 
 COMMAND_TABLE = {
 	'configure': command_configure,
+	'branch': command_branch,
 	'cd': command_cd,
 	'shell': command_shell,
 	'subagent': command_subagent,
@@ -1022,6 +1035,11 @@ def build_parser() -> argparse.ArgumentParser:
 	)
 	configure_parser.add_argument("var", nargs='?', help="Config variable to set.")
 	configure_parser.add_argument("value", nargs='?', help="Config value to set.")
+	branch_parser = subparsers.add_parser(
+		"branch",
+		help="Set this workdir's branch.",
+	)
+	branch_parser.add_argument("name", help="Branch name to set.")
 	subparsers.add_parser(
 		"cd",
 		help="Create or select the configured workspace and start a host shell in root/<workdir>.",
