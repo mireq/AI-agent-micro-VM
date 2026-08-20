@@ -7,6 +7,7 @@ import os
 import pwd
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -108,6 +109,7 @@ VALID_NET_ALLOW_RULES = frozenset(('host_connect_sandbox', 'sandbox_connect_host
 WORKSPACE_SCRIPTS = (
 	'workspace_post_create',
 	'workspace_pre_enter',
+	'workspace_pre_remove',
 )
 
 
@@ -132,6 +134,10 @@ class CommandContext:
 	@property
 	def pre_enter_script(self) -> Path:
 		return self.workspace_path / 'scripts' / 'workspace_pre_enter'
+
+	@property
+	def pre_remove_script(self) -> Path:
+		return self.workspace_path / 'scripts' / 'workspace_pre_remove'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -226,19 +232,23 @@ def ensure_workspace_config(workdir: Path) -> tuple[Path, Path, Path]:
 	return workspace_path, config_path, agent_config
 
 
+def workspace_script_env(branch: str, workspace: Path) -> dict[str, str]:
+	env = os.environ.copy()
+	env['AGENT_BRANCH'] = branch
+	env['AGENT_WORKSPACE_DIR'] = str(workspace)
+	return env
+
+
 def ensure_workspace(context: CommandContext, name: str) -> Path:
 	final_dir = context.workspace_path / 'workspaces' / name
 	is_new_workspace = not final_dir.exists()
 	final_dir.mkdir(parents=True, exist_ok=True)
 
 	if is_new_workspace:
-		env = os.environ.copy()
-		env['AGENT_BRANCH'] = name
-		env['AGENT_WORKSPACE_DIR'] = str(final_dir)
 		result = subprocess.run(
 			[str(context.post_create_script)],
 			check=False,
-			env=env,
+			env=workspace_script_env(name, final_dir),
 		)
 		if result.returncode != 0:
 			raise CommandError(
@@ -550,10 +560,24 @@ def run_pre_enter(context: CommandContext, workspace: Path, branch: str) -> None
 	result = subprocess.run(
 		[str(context.pre_enter_script), str(workspace), branch],
 		check=False,
+		env=workspace_script_env(branch, workspace),
 	)
 	if result.returncode != 0:
 		raise CommandError(
 			f"workspace_pre_enter failed with exit code {result.returncode}",
+			return_code=result.returncode,
+		)
+
+
+def run_pre_remove(context: CommandContext, workspace: Path, branch: str) -> None:
+	result = subprocess.run(
+		[str(context.pre_remove_script)],
+		check=False,
+		env=workspace_script_env(branch, workspace),
+	)
+	if result.returncode != 0:
+		raise CommandError(
+			f"workspace_pre_remove failed with exit code {result.returncode}",
 			return_code=result.returncode,
 		)
 
@@ -889,9 +913,36 @@ def command_subagent(context: CommandContext) -> int:
 def command_umount(context: CommandContext) -> int:
 	branch = current_branch(context)
 	workspace = context.workspace_path / 'workspaces' / branch
+	unmount_workspace(workspace)
+
+	return 0
+
+
+def confirm_remove_workspace(workspace: Path, branch: str) -> None:
+	sys.stderr.write(f"Remove workspace branch \"{branch}\" at {workspace}? [y/N] ")
+	sys.stderr.flush()
+	answer = sys.stdin.readline().strip().lower()
+	if answer not in ('y', 'yes'):
+		raise CommandError("remove aborted", return_code=1)
+
+
+def unmount_workspace(workspace: Path) -> None:
 	for mount_path in mounted_paths_under(workspace):
 		unmount_path(mount_path)
 
+
+def command_rm(context: CommandContext) -> int:
+	branch = current_branch(context)
+	workspace = context.workspace_path / 'workspaces' / branch
+	if not workspace.exists():
+		raise CommandError(f"workspace does not exist: {workspace}", return_code=1)
+
+	if not context.args.yes:
+		confirm_remove_workspace(workspace, branch)
+
+	run_pre_remove(context, workspace, branch)
+	unmount_workspace(workspace)
+	shutil.rmtree(workspace)
 	return 0
 
 
@@ -930,6 +981,7 @@ COMMAND_TABLE = {
 	'shell': command_shell,
 	'subagent': command_subagent,
 	'umount': command_umount,
+	'rm': command_rm,
 	'ls': command_ls,
 }
 
@@ -980,6 +1032,15 @@ def build_parser() -> argparse.ArgumentParser:
 	subparsers.add_parser(
 		"umount",
 		help="Unmount FUSE mounts in the configured workspace.",
+	)
+	rm_parser = subparsers.add_parser(
+		"rm",
+		help="Run workspace_pre_remove, unmount, and remove the current branch workspace.",
+	)
+	rm_parser.add_argument(
+		"--yes",
+		action='store_true',
+		help="Remove without prompting.",
 	)
 	ls_parser = subparsers.add_parser(
 		"ls",
