@@ -529,6 +529,17 @@ def bwrap_command(
 	]
 	if not network.isolated:
 		args.append('--share-net')
+	env_args = [
+		'--setenv',
+		'AGENT_BRANCH',
+		branch,
+		'--setenv',
+		'PWD',
+		str(workdir),
+	]
+	for env_name in ('HOME', 'USER', 'LOGNAME', 'SHELL', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM'):
+		if env_name in os.environ:
+			env_args.extend(['--setenv', env_name, os.environ[env_name]])
 	args.extend(
 		[
 			*bwrap_mount_args(context, workspace),
@@ -536,14 +547,12 @@ def bwrap_command(
 			'/proc',
 			'--dev',
 			'/dev',
+			'--tmpfs',
+			'/tmp',
+			'--clearenv',
 			'--chdir',
 			str(workdir),
-			'--setenv',
-			'AGENT_BRANCH',
-			branch,
-			'--setenv',
-			'PWD',
-			str(workdir),
+			*env_args,
 			*(extra_options or []),
 			'--',
 			*command,
