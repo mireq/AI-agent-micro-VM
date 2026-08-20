@@ -28,6 +28,7 @@ class CommandError(RuntimeError):
 
 @dataclasses.dataclass(frozen=True)
 class CommandContext:
+	args: argparse.Namespace
 	workdir: Path
 	workspace_path: Path
 	config_path: Path
@@ -136,10 +137,17 @@ def get_shell_command() -> list[str]:
 	return ["/bin/sh"]
 
 
-def enter_workspace_shell(final_dir: Path, name: str) -> int:
+def enter_workspace_shell(final_dir: Path, branch: str) -> int:
 	command = get_shell_command()
+	return enter_workspace_command(final_dir, branch, command)
+
+
+def enter_workspace_command(final_dir: Path, branch: str, command: list[str]) -> int:
+	if not command:
+		raise CommandError("command must not be empty", return_code=2)
+
 	env = os.environ.copy()
-	env["AGENT_WORKSPACE"] = name
+	env["AGENT_BRANCH"] = branch
 	env["PWD"] = str(final_dir)
 
 	os.chdir(final_dir)
@@ -159,24 +167,42 @@ def configured_branch(config: dict) -> str:
 	return branch
 
 
-def workspace_name(branch: str) -> str:
-	current_workspace = os.environ.get("AGENT_WORKSPACE")
-	if current_workspace:
-		return f"{current_workspace}{WORKSPACE_SEPARATOR}{branch}"
+def current_branch(context: CommandContext) -> str:
+	configured_agent_branch = os.environ.get("AGENT_BRANCH")
+	if configured_agent_branch:
+		return configured_agent_branch
 
-	return branch
+	config = read_toml_file(context.config_path)
+	return configured_branch(config)
+
+
+def subagent_branch(branch: str, name: str) -> str:
+	if not name:
+		raise CommandError("subagent name must not be empty", return_code=2)
+
+	return f"{branch}{WORKSPACE_SEPARATOR}{name}"
 
 
 def command_cd(context: CommandContext) -> int:
-	config = read_toml_file(context.config_path)
-	name = workspace_name(configured_branch(config))
-	final_dir = ensure_workspace(context, name)
-	return enter_workspace_shell(final_dir, name)
+	branch = current_branch(context)
+	final_dir = ensure_workspace(context, branch)
+	return enter_workspace_shell(final_dir, branch)
+
+
+def command_subagent(context: CommandContext) -> int:
+	branch = subagent_branch(current_branch(context), context.args.name)
+	final_dir = ensure_workspace(context, branch)
+	command = context.args.exec_command
+	if not command:
+		raise CommandError("subagent command is required", return_code=2)
+
+	return enter_workspace_command(final_dir, branch, command)
 
 
 COMMAND_TABLE = {
 	"configure": command_configure,
 	"cd": command_cd,
+	"subagent": command_subagent,
 }
 
 
@@ -201,6 +227,12 @@ def build_parser() -> argparse.ArgumentParser:
 		"cd",
 		help="Create or select the configured workspace and start a shell there.",
 	)
+	subagent_parser = subparsers.add_parser(
+		"subagent",
+		help="Create or select a child workspace and run a command there.",
+	)
+	subagent_parser.add_argument("name", help="Subagent branch suffix.")
+	subagent_parser.add_argument("exec_command", nargs=argparse.REMAINDER, help="Command to run.")
 
 	return parser
 
@@ -210,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
 	workdir = resolve_workdir(args.workdir)
 	workspace_path, config_path = ensure_workspace_config(workdir)
 	context = CommandContext(
+		args=args,
 		workdir=workdir,
 		workspace_path=workspace_path,
 		config_path=config_path,
