@@ -366,9 +366,7 @@ def stringify_env_value(value: object, key: str, source_name: str) -> str:
 	raise CommandError(f"{source_name}: env.{key} must be a string, number, or boolean", return_code=2)
 
 
-def configured_env(context: CommandContext) -> dict[str, str]:
-	config = read_toml_file(context.config_path)
-	source_name = str(context.config_path)
+def parse_env(config: dict, source_name: str) -> dict[str, str]:
 	raw_env = config.get('env', {})
 	if raw_env is None:
 		return {}
@@ -376,6 +374,12 @@ def configured_env(context: CommandContext) -> dict[str, str]:
 		raise CommandError(f"{source_name}: 'env' must be a table", return_code=2)
 
 	return {str(key): stringify_env_value(value, str(key), source_name) for key, value in raw_env.items()}
+
+
+def configured_env(context: CommandContext) -> dict[str, str]:
+	env = parse_env(read_toml_file(context.agent_config_path), str(context.agent_config_path))
+	env.update(parse_env(read_toml_file(context.config_path), str(context.config_path)))
+	return env
 
 
 def root_dir(workspace: Path) -> Path:
