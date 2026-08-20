@@ -3,6 +3,7 @@ import argparse
 import dataclasses
 import hashlib
 import os
+import pwd
 import shlex
 import subprocess
 import sys
@@ -123,6 +124,29 @@ def open_editor(path: Path) -> int:
 	return subprocess.call([*command, str(path)])
 
 
+def get_shell_command() -> list[str]:
+	configured_shell = os.environ.get("SHELL")
+	if configured_shell:
+		return shlex.split(configured_shell)
+
+	login_shell = pwd.getpwuid(os.getuid()).pw_shell
+	if login_shell:
+		return [login_shell]
+
+	return ["/bin/sh"]
+
+
+def enter_workspace_shell(final_dir: Path, name: str) -> int:
+	command = get_shell_command()
+	env = os.environ.copy()
+	env["AGENT_WORKSPACE"] = name
+	env["PWD"] = str(final_dir)
+
+	os.chdir(final_dir)
+	os.execvpe(command[0], command, env)
+	raise AssertionError("os.execvpe returned unexpectedly")
+
+
 def command_configure(context: CommandContext) -> int:
 	return open_editor(context.config_path)
 
@@ -147,8 +171,7 @@ def command_cd(context: CommandContext) -> int:
 	config = read_toml_file(context.config_path)
 	name = workspace_name(configured_branch(config))
 	final_dir = ensure_workspace(context, name)
-	sys.stdout.write(f"{final_dir}\n")
-	return 0
+	return enter_workspace_shell(final_dir, name)
 
 
 COMMAND_TABLE = {
@@ -176,7 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
 	)
 	subparsers.add_parser(
 		"cd",
-		help="Create or select the configured workspace and print its directory.",
+		help="Create or select the configured workspace and start a shell there.",
 	)
 
 	return parser
