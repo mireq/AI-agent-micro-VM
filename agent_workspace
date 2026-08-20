@@ -910,6 +910,31 @@ def command_shell(context: CommandContext) -> int:
 	)
 
 
+def parsed_exec_command(context: CommandContext) -> list[str]:
+	args = context.args.exec_command
+	if not args or args[0] != '--' or len(args) == 1:
+		raise CommandError("exec requires -- followed by command", return_code=2)
+
+	return args[1:]
+
+
+def command_exec(context: CommandContext) -> int:
+	command = parsed_exec_command(context)
+	branch = current_branch(context)
+	workspace = ensure_workspace(context, branch)
+	prepare_workspace_root(context, workspace)
+	run_pre_enter(context, workspace, branch)
+	return enter_bwrap_command(
+		context,
+		workspace,
+		context.workdir,
+		branch,
+		command,
+		configured_network(context, isolated=not context.args.shared_network),
+		extra_options=['--new-session'],
+	)
+
+
 def command_subagent(context: CommandContext) -> int:
 	command = context.args.exec_command
 	if not command:
@@ -1009,6 +1034,7 @@ COMMAND_TABLE = {
 	'branch': command_branch,
 	'cd': command_cd,
 	'shell': command_shell,
+	'exec': command_exec,
 	'subagent': command_subagent,
 	'umount': command_umount,
 	'rm': command_rm,
@@ -1058,6 +1084,16 @@ def build_parser() -> argparse.ArgumentParser:
 		action='store_true',
 		help="Print isolated network setup details.",
 	)
+	exec_parser = subparsers.add_parser(
+		"exec",
+		help="Run a command in the configured workspace with bwrap.",
+	)
+	exec_parser.add_argument(
+		'--shared-network',
+		action='store_true',
+		help="Share host networking instead of using isolated networking.",
+	)
+	exec_parser.add_argument("exec_command", nargs=argparse.REMAINDER, help="Use -- followed by command and arguments.")
 	subagent_parser = subparsers.add_parser(
 		"subagent",
 		help="Create or select a child workspace and run a command there.",
