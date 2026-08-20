@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import dataclasses
+import datetime
 import hashlib
 import json
 import os
@@ -106,6 +107,7 @@ WORKSPACE_SEPARATOR = '__'
 VALID_MOUNT_FLAGS = frozenset(('r', 'w', 'o'))
 DEFAULT_NET_PROTOCOL = 'tcp'
 VALID_NET_ALLOW_RULES = frozenset(('host_connect_sandbox', 'sandbox_connect_host'))
+VM_LOG_TIMESTAMP_FORMAT = '%Y%m%dT%H%M%SZ'
 WORKSPACE_SCRIPTS = (
 	'workspace_post_create',
 	'workspace_pre_enter',
@@ -641,6 +643,85 @@ def enter_workspace_command(final_dir: Path, branch: str, command: list[str]) ->
 	raise AssertionError("os.execvpe returned unexpectedly")
 
 
+def bwrap_env(context: CommandContext, workdir: Path, branch: str) -> dict[str, str]:
+	env = {
+		'AGENT_BRANCH': branch,
+		'PWD': str(workdir),
+	}
+	for env_name in ('HOME', 'USER', 'LOGNAME', 'SHELL', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM'):
+		if env_name in os.environ:
+			env[env_name] = os.environ[env_name]
+	env.update(configured_env(context))
+	return env
+
+
+def bwrap_env_args(env: dict[str, str]) -> list[str]:
+	args = []
+	for env_name, env_value in env.items():
+		args.extend(['--setenv', env_name, env_value])
+	return args
+
+
+def shell_quote_args(args: list[str]) -> str:
+	return ' '.join(shlex.quote(item) for item in args)
+
+
+def vm_log_path(context: CommandContext, workspace: Path) -> Path:
+	log_dir = Path(os.environ.get('AGENT_VM_LOG_DIR', str(context.workdir / '.agent_vm')))
+	log_basename = os.environ.get(
+		'AGENT_VM_LOG_BASENAME',
+		f'{datetime.datetime.now(datetime.UTC).strftime(VM_LOG_TIMESTAMP_FORMAT)}-{os.getpid()}',
+	)
+	log_path = log_dir / f'{log_basename}.krun.log'
+	if log_dir.is_absolute() and log_dir.is_relative_to(context.workdir):
+		mapped_log_path = root_target(workspace, log_path)
+		mapped_log_path.parent.mkdir(parents=True, exist_ok=True)
+		mapped_log_path.write_text('', encoding='utf-8')
+	else:
+		log_dir.mkdir(parents=True, exist_ok=True)
+		log_path.write_text('', encoding='utf-8')
+
+	return log_path
+
+
+def setpriv_command() -> list[str]:
+	uid = os.getuid()
+	gid = os.getgid()
+	groups = list(dict.fromkeys(group for group in os.getgroups() if group != gid))
+	command = ['/usr/bin/setpriv', '--reuid', str(uid), '--regid', str(gid)]
+	if groups:
+		command.extend(['--groups', ','.join(str(group) for group in groups)])
+	else:
+		command.append('--clear-groups')
+
+	return command
+
+
+def chroot_vm_command(context: CommandContext, workspace: Path, workdir: Path, command: list[str], env: dict[str, str]) -> list[str]:
+	vm_command = ['env', '-i', *[f'{key}={value}' for key, value in env.items()], *command]
+	shell_command = f'cd {shlex.quote(str(workdir))} && exec {shell_quote_args(vm_command)}'
+	return [
+		'chroot_vm',
+		f'--log={vm_log_path(context, workspace)}',
+		'/',
+		*setpriv_command(),
+		'/bin/sh',
+		'-lc',
+		shell_command,
+	]
+
+
+def bwrap_dev_args(vm: bool) -> list[str]:
+	if vm:
+		kvm_path = Path('/dev/kvm')
+		if not kvm_path.exists():
+			raise CommandError("VM mode requires /dev/kvm", return_code=1)
+
+		return ['--dev', '/dev', '--dev-bind', str(kvm_path), str(kvm_path)]
+
+	return ['--dev', '/dev']
+
+
 def bwrap_command(
 	context: CommandContext,
 	workspace: Path,
@@ -649,6 +730,7 @@ def bwrap_command(
 	command: list[str],
 	network: NetworkConfig,
 	extra_options: list[str] | None = None,
+	vm: bool = False,
 ) -> list[str]:
 	if not command:
 		raise CommandError("command must not be empty", return_code=2)
@@ -660,32 +742,20 @@ def bwrap_command(
 	]
 	if not network.isolated:
 		args.append('--share-net')
-	env_args = [
-		'--setenv',
-		'AGENT_BRANCH',
-		branch,
-		'--setenv',
-		'PWD',
-		str(workdir),
-	]
-	for env_name in ('HOME', 'USER', 'LOGNAME', 'SHELL', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM'):
-		if env_name in os.environ:
-			env_args.extend(['--setenv', env_name, os.environ[env_name]])
-	for env_name, env_value in configured_env(context).items():
-		env_args.extend(['--setenv', env_name, env_value])
+	env = bwrap_env(context, workdir, branch)
+	command = chroot_vm_command(context, workspace, workdir, command, env) if vm else command
 	args.extend(
 		[
 			*bwrap_mount_args(context, workspace),
 			'--proc',
 			'/proc',
-			'--dev',
-			'/dev',
+			*bwrap_dev_args(vm),
 			'--tmpfs',
 			'/tmp',
 			'--clearenv',
 			'--chdir',
 			str(workdir),
-			*env_args,
+			*bwrap_env_args(env),
 			*(extra_options or []),
 			'--',
 			*command,
@@ -702,13 +772,14 @@ def enter_bwrap_command(
 	command: list[str],
 	network: NetworkConfig,
 	extra_options: list[str] | None = None,
+	vm: bool = False,
 ) -> int:
 	if network.isolated:
-		return run_isolated_bwrap(context, workspace, workdir, branch, command, network, extra_options=extra_options)
+		return run_isolated_bwrap(context, workspace, workdir, branch, command, network, extra_options=extra_options, vm=vm)
 
 	os.execvpe(
 		'bwrap',
-		bwrap_command(context, workspace, workdir, branch, command, network, extra_options=extra_options),
+		bwrap_command(context, workspace, workdir, branch, command, network, extra_options=extra_options, vm=vm),
 		os.environ.copy(),
 	)
 	raise AssertionError("os.execvpe returned unexpectedly")
@@ -797,6 +868,7 @@ def run_isolated_bwrap(
 	command: list[str],
 	network: NetworkConfig,
 	extra_options: list[str] | None = None,
+	vm: bool = False,
 ) -> int:
 	status_read_fd, status_write_fd = os.pipe()
 	block_read_fd, block_write_fd = os.pipe()
@@ -814,6 +886,7 @@ def run_isolated_bwrap(
 			'--block-fd',
 			str(block_read_fd),
 		],
+		vm=vm,
 	)
 	bwrap = subprocess.Popen(
 		bwrap_args,
@@ -907,6 +980,8 @@ def command_shell(context: CommandContext) -> int:
 		branch,
 		get_shell_command(),
 		configured_network(context, isolated=not context.args.shared_network, verbose=context.args.verbose),
+		extra_options=['--new-session'] if context.args.vm else None,
+		vm=context.args.vm,
 	)
 
 
@@ -932,6 +1007,7 @@ def command_exec(context: CommandContext) -> int:
 		command,
 		configured_network(context, isolated=not context.args.shared_network),
 		extra_options=['--new-session'],
+		vm=context.args.vm,
 	)
 
 
@@ -1084,6 +1160,11 @@ def build_parser() -> argparse.ArgumentParser:
 		action='store_true',
 		help="Print isolated network setup details.",
 	)
+	shell_parser.add_argument(
+		'--vm',
+		action='store_true',
+		help="Run the shell through chroot_vm.",
+	)
 	exec_parser = subparsers.add_parser(
 		"exec",
 		help="Run a command in the configured workspace with bwrap.",
@@ -1092,6 +1173,11 @@ def build_parser() -> argparse.ArgumentParser:
 		'--shared-network',
 		action='store_true',
 		help="Share host networking instead of using isolated networking.",
+	)
+	exec_parser.add_argument(
+		'--vm',
+		action='store_true',
+		help="Run the command through chroot_vm.",
 	)
 	exec_parser.add_argument("exec_command", nargs=argparse.REMAINDER, help="Use -- followed by command and arguments.")
 	subagent_parser = subparsers.add_parser(
