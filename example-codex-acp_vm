@@ -3,4 +3,4 @@ set -euo pipefail
 
 NODE_PATH="$HOME/.npm"
 
-agent_vm "$NODE_PATH/bin/codex-acp" "$@"
+agent_workspace exec --vm -- "$NODE_PATH/bin/codex-acp" "$@"

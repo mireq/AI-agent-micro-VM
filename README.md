@@ -1,135 +1,257 @@
 # AI-agent-micro-VM
 
-Lightweight wrappers for running agent tooling inside a `bubblewrap` sandbox while keeping your current project directory mounted.
-
-This repository provides two launchers:
-
-- `agent_vm`: sandbox + `chroot_vm` + `setpriv` (preserves caller UID/GID and supplementary groups)
-- `agent_sandbox`: direct `bwrap` launcher (simpler, no `chroot_vm`)
-
-Also included:
-
-- `example-codex-acp_vm`: wrapper that runs `codex-acp` through `agent_vm`
-- `example_dot_agent/`: example `~/.agent` bind and npm config
-- `example_agentic_nvim_config.lua`: example ACP provider config
-
-## What Gets Isolated
-
-Both launchers use `bwrap` with:
-
-- `--unshare-all` and `--new-session`
-- host network namespace sharing (`--share-net`)
-- writable bind mount of the chosen workdir
-- `tmpfs` at `/tmp`
-- clean environment (`--clearenv`) with explicit variables re-added
-- bind mounts loaded from `${AGENT_HOME:-$HOME/.agent}/binds`
-- special built-in mounts only for `proc` and `dev`
+Workspace manager for agent processes. `agent_workspace` creates per-project,
+per-branch workspaces under `${AGENT_HOME:-$HOME/.agent}`, then runs commands in
+an isolated `bwrap` environment. It can optionally run the command through
+`chroot_vm`.
 
 ## Requirements
 
-Common:
-
 - `bwrap`
-- standard utilities: `id`, `getent`, `cut`, `date`, `env`
+- `fuse-overlayfs`
+- `fusermount3`
+- `pasta`
+- Python 3.11+
 
-`agent_vm` only:
+VM mode additionally needs:
 
-- `/usr/bin/setpriv`
 - `chroot_vm`
+- `/usr/bin/setpriv`
+- `/dev/kvm`
 
-## Usage
+## Layout
 
-Run a command in the sandbox:
+Global agent config:
 
-```bash
-./agent_vm <command> [args...]
-# or
-./agent_sandbox <command> [args...]
+```text
+${AGENT_HOME:-$HOME/.agent}/config.toml
 ```
 
-Example:
+Per-project state:
 
-```bash
-./agent_vm /bin/sh -lc 'pwd && id && env'
+```text
+${AGENT_HOME:-$HOME/.agent}/workdirs/<workdir-hash>/
 ```
 
-Set the sandbox working directory:
+Each project directory contains:
+
+```text
+config.toml
+.path
+scripts/workspace_post_create
+scripts/workspace_pre_enter
+scripts/workspace_pre_remove
+workspaces/<branch>/
+```
+
+## Basic Usage
+
+Set the current project branch:
 
 ```bash
-SANDBOX_WORKDIR=/path/to/project ./agent_vm <command>
+./agent_workspace branch develop
+```
+
+Edit the current project config:
+
+```bash
+./agent_workspace configure
+```
+
+Run a shell in the current branch workspace:
+
+```bash
+./agent_workspace shell
+```
+
+Run a command in the current branch workspace:
+
+```bash
+./agent_workspace exec -- ls
+```
+
+Run through `chroot_vm`:
+
+```bash
+./agent_workspace exec --vm -- ls
+./agent_workspace shell --vm
+```
+
+Create a subagent workspace and run a command:
+
+```bash
+./agent_workspace subagent reviewer -- my-agent review
+```
+
+List known workspaces:
+
+```bash
+./agent_workspace ls
+./agent_workspace ls -a
+```
+
+Unmount current branch mounts:
+
+```bash
+./agent_workspace umount
+```
+
+Remove current branch workspace:
+
+```bash
+./agent_workspace rm
+./agent_workspace rm --yes
+```
+
+Use another project directory:
+
+```bash
+./agent_workspace --workdir /path/to/project shell
 ```
 
 ## Configuration
 
-### Bind File
-
-Both scripts read binds from:
+`agent_workspace` creates a default global config at:
 
 ```text
-${AGENT_HOME:-$HOME/.agent}/binds
+${AGENT_HOME:-$HOME/.agent}/config.toml
 ```
 
-Optional extra bind file:
+The project config starts as:
 
-```text
-${AGENT_BIND_CONFIG_EXTRA_PATH}
+```toml
+branch = "main"
 ```
 
-Supported entries:
+Set the branch without opening an editor:
 
-```text
-w /host/path /guest/path
-r /host/path /guest/path
-/host/path:/guest/path
+```bash
+./agent_workspace configure branch develop
+./agent_workspace branch develop
+```
+
+`AGENT_BRANCH` overrides the configured branch for the current process.
+
+## Mounts
+
+Mounts are configured with `[[mount]]` entries in TOML:
+
+```toml
+[[mount]]
+flag = "r"
+src = "/usr"
+dst = "/usr"
+
+[[mount]]
+flag = "w"
+src = "/home/user/.codex"
+dst = "/home/user/.codex"
+
+[[mount]]
+flag = "o"
+src = "/path/to/source"
+dst = "/path/in/sandbox"
+```
+
+Flags:
+
+- `r`: read-only bind
+- `w`: read-write bind
+- `o`: overlay using `fuse-overlayfs`
+
+The project workdir is mounted as an overlay by default.
+
+Global mounts from `$AGENT_HOME/config.toml` are combined with project mounts
+from `workdirs/<hash>/config.toml`.
+
+See [example_dot_agent/config.toml](example_dot_agent/config.toml).
+
+## Environment
+
+Add environment variables with an `[env]` table:
+
+```toml
+[env]
+NPM_CONFIG_USERCONFIG = "/home/user/.npmrc"
+CI = true
+```
+
+`[env]` from the global config is loaded first. `[env]` from the project config
+overrides global values.
+
+## Network
+
+Network isolation is enabled by default for `shell`, `exec`, and `subagent`.
+
+Use host networking:
+
+```bash
+./agent_workspace shell --shared-network
+./agent_workspace exec --shared-network -- curl https://example.com/
+```
+
+Allowed port mappings are configured in project `config.toml`:
+
+```toml
+[[net]]
+allow = "sandbox_connect_host"
+host_port = 3306
+sandbox_port = 3306
+
+[[net]]
+allow = "host_connect_sandbox"
+host_port = 8080
+sandbox_port = 80
 ```
 
 Rules:
 
-- `w` = read-write bind
-- `r` = read-only bind
-- `source:target` defaults to read-write
-- `~` expands to host home
-- missing source paths are ignored
-- malformed lines are skipped with a warning
-- non-special mounts are no longer hardcoded in launchers; provide required runtime mounts in this file
-- if `AGENT_BIND_CONFIG_EXTRA_PATH` is set, that file loads after default binds and entries are additive
+- `sandbox_connect_host`: sandbox connects to a selected host localhost port
+- `host_connect_sandbox`: host connects to a selected sandbox localhost port
 
-See [example_dot_agent/binds](/home/mirec/AI-agent-micro-VM/example_dot_agent/binds).
+Only TCP is supported.
 
-### Environment Variables
-
-- `SANDBOX_WORKDIR`: mounted project directory and initial cwd inside sandbox
-- `AGENT_HOME`: location of `binds` file (default `$HOME/.agent`)
-- `AGENT_BIND_CONFIG_EXTRA_PATH`: optional extra binds file loaded in addition to `$AGENT_HOME/binds`
-- `AGENT_SANDBOX_INCLUDE_ENV_VARS`: comma-separated vars copied in (default `HOME,LOGNAME,PATH,SHELL,USER`)
-- `AGENT_SANDBOX_OVERRIDE_ENV_VARS`: comma-separated `KEY=VALUE` pairs injected in sandbox
-
-`agent_vm` only:
-
-- `AGENT_VM_LOG_DIR`: directory for `chroot_vm` log file (default `<workdir>/.agent_vm`)
-- `AGENT_VM_LOG_BASENAME`: log basename (default `<utc-timestamp>-<pid>`)
-
-Example:
+Print network setup details:
 
 ```bash
-AGENT_SANDBOX_INCLUDE_ENV_VARS=HOME,PATH,SSH_AUTH_SOCK \
-AGENT_SANDBOX_OVERRIDE_ENV_VARS='NPM_CONFIG_USERCONFIG=/home/mirec/.npmrc,CI=1' \
-./agent_vm my-agent
+./agent_workspace shell --verbose
 ```
+
+## Workspace Hooks
+
+These executable scripts are created for every project if missing:
+
+```text
+scripts/workspace_post_create
+scripts/workspace_pre_enter
+scripts/workspace_pre_remove
+```
+
+`workspace_post_create` and `workspace_pre_remove` receive:
+
+```text
+AGENT_BRANCH
+AGENT_WORKSPACE_DIR
+```
+
+`workspace_pre_enter` receives the same environment and is also called with the
+workspace path and branch as positional arguments for compatibility.
 
 ## Example `codex-acp` Setup
 
-1. Install `codex-acp` under `~/.npm/bin/codex-acp`.
-2. Create `~/.agent` and copy the examples:
+Install `codex-acp` under `~/.npm/bin/codex-acp`.
+
+Create agent config from the example:
 
 ```bash
-mkdir -p ~/.agent ~/.agent/npm
-cp example_dot_agent/binds ~/.agent/binds
+mkdir -p ~/.agent
+cp example_dot_agent/config.toml ~/.agent/config.toml
 cp example_dot_agent/npmrc ~/.agent/npmrc
 ```
 
-3. Keep the runtime/system bind lines in `~/.agent/binds`
-4. Run the wrapper:
+Edit `~/.agent/config.toml` and replace `/home/user` with your home directory.
+
+Run the wrapper:
 
 ```bash
 ./example-codex-acp_vm --help
@@ -139,32 +261,25 @@ Wrapper contents:
 
 ```bash
 NODE_PATH="$HOME/.npm"
-agent_vm "$NODE_PATH/bin/codex-acp" "$@"
+agent_workspace exec --vm -- "$NODE_PATH/bin/codex-acp" "$@"
 ```
 
-Neovim ACP sample: [example_agentic_nvim_config.lua](/home/mirec/AI-agent-micro-VM/example_agentic_nvim_config.lua)
+Neovim ACP sample:
+[example_agentic_nvim_config.lua](example_agentic_nvim_config.lua)
 
-## Logs (`agent_vm`)
+## Logs
 
-`agent_vm` writes one log file per run to:
+VM mode writes one log file per run to:
 
 ```text
 ${AGENT_VM_LOG_DIR:-$PWD/.agent_vm}/<timestamp-and-pid>.krun.log
 ```
 
-Use these logs when sandbox bootstrap succeeds but command execution fails later.
+`AGENT_VM_LOG_BASENAME` can override the generated log basename.
 
 ## Security Notes
 
-- Networking is shared with the caller (`--share-net`), so there is no network isolation by default.
-- Any bind-mounted path is accessible to the sandboxed process with the permissions you grant (`r`/`w`).
-- The example bind file includes runtime/system binds needed by the launchers plus a writable `.codex` mount for convenience; remove the `.codex` line if you do not want shared agent state/credentials.
-
-## Network Namespace Integration
-
-Because launchers use `--share-net`, they remain in whichever network namespace launched them. You can wrap with `ip netns exec` if you want external network control:
-
-```bash
-sudo ip netns add agentns
-sudo ip netns exec agentns /home/mirec/AI-agent-micro-VM/agent_vm <command>
-```
+- Default networking is isolated.
+- `--shared-network` intentionally removes the network boundary.
+- Any `w` mount is writable by the sandboxed process.
+- VM mode exposes `/dev/kvm` to bwrap, but does not bind the whole host `/dev`.

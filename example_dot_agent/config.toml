@@ -1,0 +1,17 @@
+[[mount]]
+flag = "r"
+src = "/home/user/.agent/npmrc"
+dst = "/home/user/.npmrc"
+
+[[mount]]
+flag = "w"
+src = "/home/user/.agent/npm"
+dst = "/home/user/.npm"
+
+[[mount]]
+flag = "w"
+src = "/home/user/.codex"
+dst = "/home/user/.codex"
+
+[env]
+NPM_CONFIG_USERCONFIG = "/home/user/.npmrc"
