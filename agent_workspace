@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 DEFAULT_WORKDIR_CONFIG = 'branch = "main"\n'
-DEFAULT_AGENT_CONFIG = """[[mount]]
+DEFAULT_AGENT_CONFIG = '''[[mount]]
 flag = "r"
 src = "/usr"
 dst = "/usr"
@@ -97,13 +97,13 @@ dst = "/etc/pki"
 flag = "r"
 src = "/etc/man_db.conf"
 dst = "/etc/man_db.conf"
-"""
-DEFAULT_SCRIPT = "#!/usr/bin/env bash\n"
-WORKSPACE_SEPARATOR = "__"
-VALID_MOUNT_FLAGS = frozenset(("r", "w", "o"))
+'''
+DEFAULT_SCRIPT = '#!/usr/bin/env bash\n'
+WORKSPACE_SEPARATOR = '__'
+VALID_MOUNT_FLAGS = frozenset(('r', 'w', 'o'))
 WORKSPACE_SCRIPTS = (
-	"workspace_post_create",
-	"workspace_pre_enter",
+	'workspace_post_create',
+	'workspace_pre_enter',
 )
 
 
@@ -121,6 +121,14 @@ class CommandContext:
 	config_path: Path
 	agent_config_path: Path
 
+	@property
+	def post_create_script(self) -> Path:
+		return self.workspace_path / 'scripts' / 'workspace_post_create'
+
+	@property
+	def pre_enter_script(self) -> Path:
+		return self.workspace_path / 'scripts' / 'workspace_pre_enter'
+
 
 @dataclasses.dataclass(frozen=True)
 class MountSpec:
@@ -130,7 +138,7 @@ class MountSpec:
 
 
 def default_workdir() -> Path:
-	return Path(os.environ.get("PWD", os.getcwd()))
+	return Path(os.environ.get('PWD', os.getcwd()))
 
 
 def resolve_workdir(workdir: str) -> Path:
@@ -138,35 +146,35 @@ def resolve_workdir(workdir: str) -> Path:
 
 
 def agent_home() -> Path:
-	return Path(os.environ.get("AGENT_HOME", "~/.agent")).expanduser()
+	return Path(os.environ.get('AGENT_HOME', '~/.agent')).expanduser()
 
 
 def agent_config_path() -> Path:
-	return agent_home() / "config.toml"
+	return agent_home() / 'config.toml'
 
 
 def workdir_hash(workdir: Path) -> str:
-	return hashlib.sha256(str(workdir).encode("utf-8")).hexdigest()
+	return hashlib.sha256(str(workdir).encode('utf-8')).hexdigest()
 
 
 def workspace_dir(workdir: Path) -> Path:
-	return agent_home() / "workdirs" / workdir_hash(workdir)
+	return agent_home() / 'workdirs' / workdir_hash(workdir)
 
 
 def initialize_workspace_scripts(workspace_path: Path) -> None:
-	scripts_path = workspace_path / "scripts"
+	scripts_path = workspace_path / 'scripts'
 	scripts_path.mkdir(parents=True, exist_ok=True)
 
 	for script_name in WORKSPACE_SCRIPTS:
 		script_path = scripts_path / script_name
 		if not script_path.exists():
-			script_path.write_text(DEFAULT_SCRIPT, encoding="utf-8")
+			script_path.write_text(DEFAULT_SCRIPT, encoding='utf-8')
 		script_path.chmod(0o755)
 
 
 def read_toml_file(path: Path) -> dict:
 	try:
-		with path.open("rb") as file:
+		with path.open('rb') as file:
 			return tomllib.load(file)
 	except tomllib.TOMLDecodeError as exc:
 		raise CommandError(f"failed to parse {path}: {exc}", return_code=2) from exc
@@ -177,7 +185,7 @@ def ensure_agent_config() -> Path:
 	config_path.parent.mkdir(parents=True, exist_ok=True)
 
 	if not config_path.exists():
-		config_path.write_text(DEFAULT_AGENT_CONFIG, encoding="utf-8")
+		config_path.write_text(DEFAULT_AGENT_CONFIG, encoding='utf-8')
 
 	return config_path
 
@@ -185,34 +193,30 @@ def ensure_agent_config() -> Path:
 def ensure_workspace_config(workdir: Path) -> tuple[Path, Path, Path]:
 	agent_config = ensure_agent_config()
 	workspace_path = workspace_dir(workdir)
-	config_path = workspace_path / "config.toml"
+	config_path = workspace_path / 'config.toml'
 	workspace_path.mkdir(parents=True, exist_ok=True)
 
 	if not config_path.exists():
-		config_path.write_text(DEFAULT_WORKDIR_CONFIG, encoding="utf-8")
+		config_path.write_text(DEFAULT_WORKDIR_CONFIG, encoding='utf-8')
 
 	initialize_workspace_scripts(workspace_path)
 
 	return workspace_path, config_path, agent_config
 
 
-def post_create_script(workspace_path: Path) -> Path:
-	return workspace_path / "scripts" / "workspace_post_create"
-
-
-def pre_enter_script(workspace_path: Path) -> Path:
-	return workspace_path / "scripts" / "workspace_pre_enter"
-
-
 def ensure_workspace(context: CommandContext, name: str) -> Path:
-	final_dir = context.workspace_path / "workspaces" / name
+	final_dir = context.workspace_path / 'workspaces' / name
 	is_new_workspace = not final_dir.exists()
 	final_dir.mkdir(parents=True, exist_ok=True)
 
 	if is_new_workspace:
+		env = os.environ.copy()
+		env['AGENT_BRANCH'] = name
+		env['AGENT_WORKSPACE_DIR'] = str(final_dir)
 		result = subprocess.run(
-			[str(post_create_script(context.workspace_path)), str(final_dir), name],
+			[str(context.post_create_script)],
 			check=False,
+			env=env,
 		)
 		if result.returncode != 0:
 			raise CommandError(
@@ -224,7 +228,7 @@ def ensure_workspace(context: CommandContext, name: str) -> Path:
 
 
 def parse_mounts(config: dict, source_name: str) -> list[MountSpec]:
-	raw_mounts = config.get("mount", [])
+	raw_mounts = config.get('mount', [])
 	if raw_mounts is None:
 		return []
 	if not isinstance(raw_mounts, list):
@@ -235,16 +239,16 @@ def parse_mounts(config: dict, source_name: str) -> list[MountSpec]:
 		if not isinstance(raw_mount, dict):
 			raise CommandError(f"{source_name}: mount #{index} must be a table", return_code=2)
 
-		flag = raw_mount.get("flag")
-		src = raw_mount.get("src")
-		dst = raw_mount.get("dst")
+		flag = raw_mount.get('flag')
+		src = raw_mount.get('src')
+		dst = raw_mount.get('dst')
 		if flag not in VALID_MOUNT_FLAGS:
 			raise CommandError(f"{source_name}: mount #{index} has invalid flag: {flag!r}", return_code=2)
 		if not isinstance(src, str) or not src:
 			raise CommandError(f"{source_name}: mount #{index} src must be a non-empty string", return_code=2)
-		if not isinstance(dst, str) or not dst.startswith("/"):
+		if not isinstance(dst, str) or not dst.startswith('/'):
 			raise CommandError(f"{source_name}: mount #{index} dst must be an absolute path", return_code=2)
-		if not src.startswith("/"):
+		if not src.startswith('/'):
 			raise CommandError(f"{source_name}: mount #{index} src must be an absolute path", return_code=2)
 
 		mounts.append(MountSpec(flag=flag, src=Path(src).expanduser(), dst=Path(os.path.normpath(dst))))
@@ -255,7 +259,7 @@ def parse_mounts(config: dict, source_name: str) -> list[MountSpec]:
 def configured_mounts(context: CommandContext) -> list[MountSpec]:
 	mounts = parse_mounts(read_toml_file(context.agent_config_path), str(context.agent_config_path))
 	mounts.extend(parse_mounts(read_toml_file(context.config_path), str(context.config_path)))
-	mounts.append(MountSpec(flag="o", src=context.workdir, dst=context.workdir))
+	mounts.append(MountSpec(flag='o', src=context.workdir, dst=context.workdir))
 	return remove_duplicate_mounts(mounts)
 
 
@@ -272,29 +276,29 @@ def remove_duplicate_mounts(mounts: list[MountSpec]) -> list[MountSpec]:
 
 
 def root_dir(workspace: Path) -> Path:
-	return workspace / "root"
+	return workspace / 'root'
 
 
 def overlay_dir(workspace: Path, mount_dst: Path) -> Path:
-	relative_dst = mount_dst.relative_to("/")
-	if str(relative_dst) == ".":
-		relative_dst = Path("__root__")
+	relative_dst = mount_dst.relative_to('/')
+	if str(relative_dst) == '.':
+		relative_dst = Path('__root__')
 
-	return workspace / "overlay" / relative_dst
+	return workspace / 'overlay' / relative_dst
 
 
 def root_target(workspace: Path, mount_dst: Path) -> Path:
-	return root_dir(workspace) / mount_dst.relative_to("/")
+	return root_dir(workspace) / mount_dst.relative_to('/')
 
 
 def decode_mountinfo_path(value: str) -> str:
-	return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
+	return re.sub(r'\\([0-7]{3})', lambda match: chr(int(match.group(1), 8)), value)
 
 
 def is_mounted(path: Path) -> bool:
 	target = str(path)
 	try:
-		with Path("/proc/self/mountinfo").open("r", encoding="utf-8") as file:
+		with Path('/proc/self/mountinfo').open('r', encoding='utf-8') as file:
 			return any(decode_mountinfo_path(line.split()[4]) == target for line in file)
 	except OSError:
 		return False
@@ -323,9 +327,9 @@ def mount_bindfs(src: Path, target: Path, read_only: bool) -> None:
 	if is_mounted(target):
 		return
 
-	command = ["bindfs"]
+	command = ['bindfs']
 	if read_only:
-		command.append("-r")
+		command.append('-r')
 	command.extend([str(src), str(target)])
 
 	run_mount_command(command, f"bindfs mount {src} at {target}")
@@ -344,16 +348,16 @@ def mount_overlay(workspace: Path, mount: MountSpec) -> None:
 		return
 
 	state_dir = overlay_dir(workspace, mount.dst)
-	upper_dir = state_dir / "upper"
-	work_dir = state_dir / "work"
+	upper_dir = state_dir / 'upper'
+	work_dir = state_dir / 'work'
 	upper_dir.mkdir(parents=True, exist_ok=True)
 	work_dir.mkdir(parents=True, exist_ok=True)
 
 	run_mount_command(
 		[
-			"fuse-overlayfs",
-			"-o",
-			f"lowerdir={src},upperdir={upper_dir},workdir={work_dir}",
+			'fuse-overlayfs',
+			'-o',
+			f'lowerdir={src},upperdir={upper_dir},workdir={work_dir}',
 			str(target),
 		],
 		f"overlay mount {src} at {target}",
@@ -365,17 +369,17 @@ def prepare_workspace_root(context: CommandContext, workspace: Path) -> Path:
 	root.mkdir(parents=True, exist_ok=True)
 
 	for mount in configured_mounts(context):
-		if mount.flag == "o":
+		if mount.flag == 'o':
 			mount_overlay(workspace, mount)
 		else:
-			mount_bindfs(mount.src, root_target(workspace, mount.dst), mount.flag == "r")
+			mount_bindfs(mount.src, root_target(workspace, mount.dst), mount.flag == 'r')
 
 	return root
 
 
 def run_pre_enter(context: CommandContext, workspace: Path, branch: str) -> None:
 	result = subprocess.run(
-		[str(pre_enter_script(context.workspace_path)), str(workspace), branch],
+		[str(context.pre_enter_script), str(workspace), branch],
 		check=False,
 	)
 	if result.returncode != 0:
@@ -386,7 +390,7 @@ def run_pre_enter(context: CommandContext, workspace: Path, branch: str) -> None
 
 
 def get_editor_command() -> list[str] | None:
-	configured_editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+	configured_editor = os.environ.get('VISUAL') or os.environ.get('EDITOR')
 	if configured_editor:
 		return shlex.split(configured_editor)
 
@@ -404,7 +408,7 @@ def open_editor(path: Path) -> int:
 def write_toml_file(path: Path, config: dict) -> None:
 	import tomli_w
 
-	path.write_text(tomli_w.dumps(config), encoding="utf-8")
+	path.write_text(tomli_w.dumps(config), encoding='utf-8')
 
 
 def update_config_value(path: Path, key: str, value: str) -> None:
@@ -415,7 +419,7 @@ def update_config_value(path: Path, key: str, value: str) -> None:
 
 
 def get_shell_command() -> list[str]:
-	configured_shell = os.environ.get("SHELL")
+	configured_shell = os.environ.get('SHELL')
 	if configured_shell:
 		return shlex.split(configured_shell)
 
@@ -423,7 +427,7 @@ def get_shell_command() -> list[str]:
 	if login_shell:
 		return [login_shell]
 
-	return ["/bin/sh"]
+	return ['/bin/sh']
 
 
 def enter_workspace_shell(final_dir: Path, branch: str) -> int:
@@ -436,8 +440,8 @@ def enter_workspace_command(final_dir: Path, branch: str, command: list[str]) ->
 		raise CommandError("command must not be empty", return_code=2)
 
 	env = os.environ.copy()
-	env["AGENT_BRANCH"] = branch
-	env["PWD"] = str(final_dir)
+	env['AGENT_BRANCH'] = branch
+	env['PWD'] = str(final_dir)
 
 	os.chdir(final_dir)
 	os.execvpe(command[0], command, env)
@@ -449,26 +453,26 @@ def enter_bwrap_command(root: Path, workdir: Path, branch: str, command: list[st
 		raise CommandError("command must not be empty", return_code=2)
 
 	os.execvpe(
-		"bwrap",
+		'bwrap',
 		[
-			"bwrap",
-			"--unshare-all",
-			"--share-net",
-			"--die-with-parent",
-			"--bind",
+			'bwrap',
+			'--unshare-all',
+			'--share-net',
+			'--die-with-parent',
+			'--bind',
 			str(root),
-			"/",
-			"--proc",
-			"/proc",
-			"--dev",
-			"/dev",
-			"--chdir",
+			'/',
+			'--proc',
+			'/proc',
+			'--dev',
+			'/dev',
+			'--chdir',
 			str(workdir),
-			"--setenv",
-			"AGENT_BRANCH",
+			'--setenv',
+			'AGENT_BRANCH',
 			branch,
-			"--setenv",
-			"PWD",
+			'--setenv',
+			'PWD',
 			str(workdir),
 			*command,
 		],
@@ -488,7 +492,7 @@ def command_configure(context: CommandContext) -> int:
 
 
 def configured_branch(config: dict) -> str:
-	branch = config.get("branch")
+	branch = config.get('branch')
 	if not isinstance(branch, str) or not branch:
 		raise CommandError("config field 'branch' must be a non-empty string", return_code=2)
 
@@ -496,7 +500,7 @@ def configured_branch(config: dict) -> str:
 
 
 def current_branch(context: CommandContext) -> str:
-	configured_agent_branch = os.environ.get("AGENT_BRANCH")
+	configured_agent_branch = os.environ.get('AGENT_BRANCH')
 	if configured_agent_branch:
 		return configured_agent_branch
 
@@ -540,10 +544,10 @@ def command_subagent(context: CommandContext) -> int:
 
 
 COMMAND_TABLE = {
-	"configure": command_configure,
-	"cd": command_cd,
-	"shell": command_shell,
-	"subagent": command_subagent,
+	'configure': command_configure,
+	'cd': command_cd,
+	'shell': command_shell,
+	'subagent': command_subagent,
 }
 
 
@@ -558,14 +562,14 @@ def build_parser() -> argparse.ArgumentParser:
 		help="Project workdir to manage. Defaults to $PWD.",
 	)
 
-	subparsers = parser.add_subparsers(dest="command", required=True)
+	subparsers = parser.add_subparsers(dest='command', required=True)
 
 	configure_parser = subparsers.add_parser(
 		"configure",
 		help="Open or update this workdir's config.toml.",
 	)
-	configure_parser.add_argument("var", nargs="?", help="Config variable to set.")
-	configure_parser.add_argument("value", nargs="?", help="Config value to set.")
+	configure_parser.add_argument("var", nargs='?', help="Config variable to set.")
+	configure_parser.add_argument("value", nargs='?', help="Config value to set.")
 	subparsers.add_parser(
 		"cd",
 		help="Create or select the configured workspace and start a host shell in root/<workdir>.",
@@ -600,7 +604,7 @@ def main(argv: list[str] | None = None) -> int:
 	return command(context)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
 	try:
 		sys.exit(main())
 	except CommandError as exc:
