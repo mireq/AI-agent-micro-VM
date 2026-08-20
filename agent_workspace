@@ -424,6 +424,63 @@ def unmount_path(path: Path) -> None:
 		raise CommandError(message, return_code=result.returncode)
 
 
+def terminal_supports_color() -> bool:
+	if not sys.stdout.isatty() or 'NO_COLOR' in os.environ:
+		return False
+
+	try:
+		import curses
+
+		curses.setupterm(fd=sys.stdout.fileno())
+		return curses.tigetnum('colors') > 0
+	except (curses.error, OSError, ValueError):
+		return False
+
+
+def colorize(value: str, color_code: str, enabled: bool) -> str:
+	if not enabled:
+		return value
+
+	return f'\033[{color_code}m{value}\033[0m'
+
+
+def color_label(value: str) -> str:
+	return value
+
+
+def read_origin_workdir(path: Path) -> str:
+	path_file = path / '.path'
+	try:
+		return path_file.read_text(encoding='utf-8').rstrip('\n')
+	except OSError:
+		return str(path)
+
+
+def iter_workspace_workdirs() -> list[tuple[str, str, list[tuple[str, bool]]]]:
+	entries = []
+	workdirs_path = agent_home() / 'workdirs'
+	if not workdirs_path.exists():
+		return entries
+
+	for workdir_path in sorted(workdirs_path.iterdir(), key=lambda item: item.name):
+		if not workdir_path.is_dir():
+			continue
+
+		origin_workdir = read_origin_workdir(workdir_path)
+		workspaces_path = workdir_path / 'workspaces'
+		if not workspaces_path.exists():
+			continue
+
+		branches = []
+		for workspace in sorted(workspaces_path.iterdir(), key=lambda item: item.name):
+			if workspace.is_dir():
+				branches.append((workspace.name, bool(mounted_paths_under(workspace))))
+		if branches:
+			entries.append((origin_workdir, workdir_path.name, branches))
+
+	return entries
+
+
 def run_mount_command(command: list[str], description: str) -> None:
 	result = subprocess.run(command, check=False, stderr=subprocess.PIPE, text=True)
 	if result.returncode != 0:
@@ -838,12 +895,42 @@ def command_umount(context: CommandContext) -> int:
 	return 0
 
 
+def command_ls(context: CommandContext) -> int:
+	use_color = terminal_supports_color()
+	label_color = '1;97'
+	path_color = '1;94'
+	hash_color = '1;95'
+	mounted_color = '1;92'
+	unmounted_color = '1;90'
+	status_width = len("unmounted")
+	workdirs_path = agent_home() / 'workdirs'
+
+	sys.stdout.write(f'{colorize(str(workdirs_path), label_color, use_color)}\n\n')
+
+	for origin_workdir, workdir_hash_value, branches in iter_workspace_workdirs():
+		visible_branches = [(branch, mounted) for branch, mounted in branches if context.args.all or mounted]
+		if not visible_branches:
+			continue
+
+		sys.stdout.write(
+			f'{colorize(workdir_hash_value, hash_color, use_color)} '
+			f'{colorize(origin_workdir, path_color, use_color)}\n'
+		)
+		for branch, mounted in visible_branches:
+			status = "mounted" if mounted else "unmounted"
+			status_color = mounted_color if mounted else unmounted_color
+			sys.stdout.write(f'  {colorize(status.ljust(status_width), status_color, use_color)}  {branch}\n')
+
+	return 0
+
+
 COMMAND_TABLE = {
 	'configure': command_configure,
 	'cd': command_cd,
 	'shell': command_shell,
 	'subagent': command_subagent,
 	'umount': command_umount,
+	'ls': command_ls,
 }
 
 
@@ -893,6 +980,16 @@ def build_parser() -> argparse.ArgumentParser:
 	subparsers.add_parser(
 		"umount",
 		help="Unmount FUSE mounts in the configured workspace.",
+	)
+	ls_parser = subparsers.add_parser(
+		"ls",
+		help="List mounted workspace branches.",
+	)
+	ls_parser.add_argument(
+		"-a",
+		"--all",
+		action='store_true',
+		help="Show unmounted workspace branches too.",
 	)
 
 	return parser
