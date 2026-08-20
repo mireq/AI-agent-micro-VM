@@ -953,16 +953,29 @@ def command_ls(context: CommandContext) -> int:
 	hash_color = '1;95'
 	mounted_color = '1;92'
 	unmounted_color = '1;90'
+	current_color = '1;93'
 	status_width = len("unmounted")
+	current_marker_width = len("(*)")
+	current_workdir_hash = workdir_hash(context.workdir)
+	current_branch_name = current_branch(context)
 	workdirs_path = agent_home() / 'workdirs'
 
 	sys.stdout.write(f'{colorize(str(workdirs_path), label_color, use_color)}\n\n')
 
-	for origin_workdir, workdir_hash_value, branches in iter_workspace_workdirs():
+	workdir_entries = sorted(
+		iter_workspace_workdirs(),
+		key=lambda entry: (entry[1] != current_workdir_hash, entry[0]),
+	)
+	for origin_workdir, workdir_hash_value, branches in workdir_entries:
 		visible_branches = [(branch, mounted) for branch, mounted in branches if context.args.all or mounted]
 		if not visible_branches:
 			continue
 
+		is_current_workdir = workdir_hash_value == current_workdir_hash
+		visible_branches = sorted(
+			visible_branches,
+			key=lambda entry: (not (is_current_workdir and entry[0] == current_branch_name), entry[0]),
+		)
 		sys.stdout.write(
 			f'{colorize(workdir_hash_value, hash_color, use_color)} '
 			f'{colorize(origin_workdir, path_color, use_color)}\n'
@@ -970,7 +983,11 @@ def command_ls(context: CommandContext) -> int:
 		for branch, mounted in visible_branches:
 			status = "mounted" if mounted else "unmounted"
 			status_color = mounted_color if mounted else unmounted_color
-			sys.stdout.write(f'  {colorize(status.ljust(status_width), status_color, use_color)}  {branch}\n')
+			current_marker = "(*)" if is_current_workdir and branch == current_branch_name else ""
+			sys.stdout.write(
+				f'  {colorize(current_marker.ljust(current_marker_width), current_color, use_color)}  '
+				f'{colorize(status.ljust(status_width), status_color, use_color)}  {branch}\n'
+			)
 
 	return 0
 
