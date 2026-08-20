@@ -1,14 +1,35 @@
 #!/usr/bin/env python3
 import argparse
+import dataclasses
 import hashlib
 import os
 import shlex
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 
 DEFAULT_CONFIG = 'branch = "main"\n'
+DEFAULT_SCRIPT = "#!/usr/bin/env bash\n"
+WORKSPACE_SEPARATOR = "__"
+WORKSPACE_SCRIPTS = (
+	"workspace_post_create",
+	"workspace_pre_enter",
+)
+
+
+class CommandError(RuntimeError):
+	def __init__(self, message: str, return_code: int = 1) -> None:
+		super().__init__(message)
+		self.return_code = return_code
+
+
+@dataclasses.dataclass(frozen=True)
+class CommandContext:
+	workdir: Path
+	workspace_path: Path
+	config_path: Path
 
 
 def default_workdir() -> Path:
@@ -31,26 +52,109 @@ def workspace_dir(workdir: Path) -> Path:
 	return agent_home() / "workdirs" / workdir_hash(workdir)
 
 
-def ensure_workspace_config(workdir: Path) -> Path:
-	config_path = workspace_dir(workdir) / "config.toml"
-	config_path.parent.mkdir(parents=True, exist_ok=True)
+def initialize_workspace_scripts(workspace_path: Path) -> None:
+	scripts_path = workspace_path / "scripts"
+	scripts_path.mkdir(parents=True, exist_ok=True)
+
+	for script_name in WORKSPACE_SCRIPTS:
+		script_path = scripts_path / script_name
+		if not script_path.exists():
+			script_path.write_text(DEFAULT_SCRIPT, encoding="utf-8")
+		script_path.chmod(0o755)
+
+
+def read_toml_file(path: Path) -> dict:
+	try:
+		with path.open("rb") as file:
+			return tomllib.load(file)
+	except tomllib.TOMLDecodeError as exc:
+		raise CommandError(f"failed to parse {path}: {exc}", return_code=2) from exc
+
+
+def ensure_workspace_config(workdir: Path) -> tuple[Path, Path]:
+	workspace_path = workspace_dir(workdir)
+	config_path = workspace_path / "config.toml"
+	workspace_path.mkdir(parents=True, exist_ok=True)
 
 	if not config_path.exists():
 		config_path.write_text(DEFAULT_CONFIG, encoding="utf-8")
 
-	return config_path
+	initialize_workspace_scripts(workspace_path)
+
+	return workspace_path, config_path
 
 
-def editor_command() -> list[str]:
+def post_create_script(workspace_path: Path) -> Path:
+	return workspace_path / "scripts" / "workspace_post_create"
+
+
+def ensure_workspace(context: CommandContext, name: str) -> Path:
+	final_dir = context.workspace_path / "workspaces" / name
+	is_new_workspace = not final_dir.exists()
+	final_dir.mkdir(parents=True, exist_ok=True)
+
+	if is_new_workspace:
+		result = subprocess.run(
+			[str(post_create_script(context.workspace_path)), str(final_dir), name],
+			check=False,
+		)
+		if result.returncode != 0:
+			raise CommandError(
+				f"workspace_post_create failed with exit code {result.returncode}",
+				return_code=result.returncode,
+			)
+
+	return final_dir
+
+
+def get_editor_command() -> list[str] | None:
 	configured_editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
 	if configured_editor:
 		return shlex.split(configured_editor)
 
-	return ["vi"]
+	return None
 
 
 def open_editor(path: Path) -> int:
-	return subprocess.call([*editor_command(), str(path)])
+	command = get_editor_command()
+	if command is None:
+		raise CommandError("editor is not configured; set VISUAL or EDITOR", return_code=2)
+
+	return subprocess.call([*command, str(path)])
+
+
+def command_configure(context: CommandContext) -> int:
+	return open_editor(context.config_path)
+
+
+def configured_branch(config: dict) -> str:
+	branch = config.get("branch")
+	if not isinstance(branch, str) or not branch:
+		raise CommandError("config field 'branch' must be a non-empty string", return_code=2)
+
+	return branch
+
+
+def workspace_name(branch: str) -> str:
+	current_workspace = os.environ.get("AGENT_WORKSPACE")
+	if current_workspace:
+		return f"{current_workspace}{WORKSPACE_SEPARATOR}{branch}"
+
+	return branch
+
+
+def command_cd(context: CommandContext) -> int:
+	config = read_toml_file(context.config_path)
+	name = workspace_name(configured_branch(config))
+	final_dir = ensure_workspace(context, name)
+	sys.stdout.write(f"{final_dir}\n")
+	return 0
+
+
+COMMAND_TABLE = {
+	"configure": command_configure,
+	"cd": command_cd,
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,7 +172,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 	subparsers.add_parser(
 		"configure",
-		help="Open this workdir's config.toml in $VISUAL, $EDITOR, or vi.",
+		help="Open this workdir's config.toml in $VISUAL or $EDITOR.",
+	)
+	subparsers.add_parser(
+		"cd",
+		help="Create or select the configured workspace and print its directory.",
 	)
 
 	return parser
@@ -77,13 +185,20 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
 	args = build_parser().parse_args(argv)
 	workdir = resolve_workdir(args.workdir)
-	config_path = ensure_workspace_config(workdir)
+	workspace_path, config_path = ensure_workspace_config(workdir)
+	context = CommandContext(
+		workdir=workdir,
+		workspace_path=workspace_path,
+		config_path=config_path,
+	)
 
-	if args.command == "configure":
-		return open_editor(config_path)
-
-	raise AssertionError(f"unhandled command: {args.command}")
+	command = COMMAND_TABLE[args.command]
+	return command(context)
 
 
 if __name__ == "__main__":
-	sys.exit(main())
+	try:
+		sys.exit(main())
+	except CommandError as exc:
+		sys.stderr.write(f"agent_workspace: error: {exc}\n")
+		sys.exit(exc.return_code)
