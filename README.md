@@ -9,6 +9,7 @@ an isolated `bwrap` environment. It can optionally run the command through
 
 - `bwrap`
 - `fuse-overlayfs`
+- `bindfs`
 - `fusermount3`
 - `pasta`
 - Python 3.11+
@@ -103,6 +104,13 @@ Remove current branch workspace:
 ./agent_workspace rm --yes
 ```
 
+Mount the current branch workspace over the project path with `bindfs`:
+
+```bash
+./agent_workspace activate
+./agent_workspace deactivate
+```
+
 Use another project directory:
 
 ```bash
@@ -165,6 +173,22 @@ Global mounts from `$AGENT_HOME/config.toml` are combined with project mounts
 from `workdirs/<hash>/config.toml`.
 
 See [example_dot_agent/config.toml](example_dot_agent/config.toml).
+
+## Activation
+
+`activate` prepares the configured branch workspace, then mounts it with
+`bindfs`:
+
+```text
+${AGENT_HOME:-$HOME/.agent}/workdirs/<workdir-hash>/workspaces/<branch>/root/<project-path>
+```
+
+over the original project path. This lets host tools such as editors keep using
+normal project paths while seeing the same workspace files as the agent.
+
+`deactivate` checks `/proc/self/mountinfo` and only unmounts the project path
+with `fusermount3` when the top mount matches a workspace branch for this
+project.
 
 ## Environment
 

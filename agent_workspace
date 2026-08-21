@@ -164,6 +164,56 @@ class NetworkConfig:
 	forwards: list[NetForward]
 
 
+@dataclasses.dataclass(frozen=True)
+class MountInfoEntry:
+	mount_id: int
+	parent_id: int
+	device: str
+	root: Path
+	mount_point: Path
+	options: str
+	filesystem_type: str
+	source: str
+	super_options: str
+
+	@classmethod
+	def parse(cls, line: str) -> 'MountInfoEntry | None':
+		fields = line.rstrip('\n').split(' ')
+		if len(fields) < 10:
+			return None
+
+		try:
+			separator = fields.index('-')
+		except ValueError:
+			return None
+		if separator < 6 or len(fields) <= separator + 3:
+			return None
+
+		try:
+			mount_id = int(fields[0])
+			parent_id = int(fields[1])
+		except ValueError:
+			return None
+
+		return cls(
+			mount_id=mount_id,
+			parent_id=parent_id,
+			device=fields[2],
+			root=Path(decode_mountinfo_path(fields[3])),
+			mount_point=Path(decode_mountinfo_path(fields[4])),
+			options=fields[5],
+			filesystem_type=fields[separator + 1],
+			source=decode_mountinfo_path(fields[separator + 2]),
+			super_options=fields[separator + 3],
+		)
+
+	def has_mount_point(self, path: Path) -> bool:
+		return self.mount_point == path
+
+	def is_under_mount_point(self, path: Path) -> bool:
+		return self.mount_point.is_relative_to(path)
+
+
 def default_workdir() -> Path:
 	return Path(os.environ.get('PWD', os.getcwd()))
 
@@ -402,34 +452,20 @@ def decode_mountinfo_path(value: str) -> str:
 	return re.sub(r'\\([0-7]{3})', lambda match: chr(int(match.group(1), 8)), value)
 
 
-def mountinfo_mount_path(line: str) -> Path | None:
-	fields = line.split(' ', 5)
-	if len(fields) < 5:
-		return None
-
-	return Path(decode_mountinfo_path(fields[4]))
-
-
-def is_mounted(path: Path) -> bool:
-	target = str(path)
+def iter_mountinfo() -> list[MountInfoEntry]:
 	try:
 		with Path('/proc/self/mountinfo').open('r', encoding='utf-8') as file:
-			return any(str(mount_path) == target for line in file if (mount_path := mountinfo_mount_path(line)) is not None)
-	except OSError:
-		return False
-
-
-def mounted_paths_under(path: Path) -> list[Path]:
-	paths = []
-	try:
-		with Path('/proc/self/mountinfo').open('r', encoding='utf-8') as file:
-			for line in file:
-				mount_path = mountinfo_mount_path(line)
-				if mount_path is not None and mount_path.is_relative_to(path):
-					paths.append(mount_path)
+			return [entry for line in file if (entry := MountInfoEntry.parse(line)) is not None]
 	except OSError:
 		return []
 
+
+def is_mounted(path: Path) -> bool:
+	return any(entry.has_mount_point(path) for entry in iter_mountinfo())
+
+
+def mounted_paths_under(path: Path) -> list[Path]:
+	paths = [entry.mount_point for entry in iter_mountinfo() if entry.is_under_mount_point(path)]
 	return sorted(paths, key=lambda item: len(item.parts), reverse=True)
 
 
@@ -502,6 +538,57 @@ def run_mount_command(command: list[str], description: str) -> None:
 	if result.returncode != 0:
 		message = result.stderr.strip() or f"{description} failed with exit code {result.returncode}"
 		raise CommandError(message, return_code=result.returncode)
+
+
+def active_workspace_mount(context: CommandContext, workspace: Path) -> MountInfoEntry | None:
+	expected_root = root_target(workspace, context.workdir)
+	entry = mount_path(context.workdir)
+	if entry is None:
+		return None
+	if entry.root == expected_root:
+		return entry
+	if entry.filesystem_type == 'fuse.bindfs' and entry.source == str(expected_root):
+		return entry
+
+	return None
+
+
+def active_workspace_branch(context: CommandContext) -> tuple[str, MountInfoEntry] | None:
+	workspaces_path = context.workspace_path / 'workspaces'
+	if not workspaces_path.exists():
+		return None
+
+	for workspace in sorted(workspaces_path.iterdir(), key=lambda item: item.name):
+		if not workspace.is_dir():
+			continue
+		entry = active_workspace_mount(context, workspace)
+		if entry is not None:
+			return workspace.name, entry
+
+	return None
+
+
+def mount_paths(path: Path) -> list[MountInfoEntry]:
+	return [entry for entry in iter_mountinfo() if entry.has_mount_point(path)]
+
+
+def mount_path(path: Path) -> MountInfoEntry | None:
+	entries = mount_paths(path)
+	if entries:
+		return entries[-1]
+
+	return None
+
+
+def bindfs_mount_path(src: Path, dst: Path) -> None:
+	run_mount_command(
+		['bindfs', '-o', f'fsname={src}', str(src), str(dst)],
+		f"bindfs mount {src} at {dst}",
+	)
+
+
+def fuse_unmount_path(path: Path) -> None:
+	unmount_path(path)
 
 
 def mount_overlay(workspace: Path, mount: MountSpec) -> None:
@@ -1027,6 +1114,33 @@ def command_subagent(context: CommandContext) -> int:
 	return enter_bwrap_command(context, workspace, context.workdir, branch, command, configured_network(context))
 
 
+def command_activate(context: CommandContext) -> int:
+	branch = current_branch(context)
+	workspace = ensure_workspace(context, branch)
+	active_branch = active_workspace_branch(context)
+	if active_branch is not None:
+		active_branch_name, _ = active_branch
+		if active_branch_name == branch:
+			return 0
+		raise CommandError(
+			f"workspace branch {active_branch_name!r} is already active at {context.workdir}",
+			return_code=1,
+		)
+
+	prepare_workspace_root(context, workspace)
+	run_pre_enter(context, workspace, branch)
+	bindfs_mount_path(root_target(workspace, context.workdir), context.workdir)
+	return 0
+
+
+def command_deactivate(context: CommandContext) -> int:
+	if active_workspace_branch(context) is None:
+		return 0
+
+	fuse_unmount_path(context.workdir)
+	return 0
+
+
 def command_umount(context: CommandContext) -> int:
 	branch = current_branch(context)
 	workspace = context.workspace_path / 'workspaces' / branch
@@ -1116,6 +1230,8 @@ COMMAND_TABLE = {
 	'shell': command_shell,
 	'exec': command_exec,
 	'subagent': command_subagent,
+	'activate': command_activate,
+	'deactivate': command_deactivate,
 	'umount': command_umount,
 	'rm': command_rm,
 	'ls': command_ls,
@@ -1190,6 +1306,14 @@ def build_parser() -> argparse.ArgumentParser:
 	)
 	subagent_parser.add_argument("name", help="Subagent branch suffix.")
 	subagent_parser.add_argument("exec_command", nargs=argparse.REMAINDER, help="Command to run.")
+	subparsers.add_parser(
+		"activate",
+		help="Mount the configured workspace branch over the project workdir with bindfs.",
+	)
+	subparsers.add_parser(
+		"deactivate",
+		help="Unmount an active workspace bindfs mount from the project workdir.",
+	)
 	subparsers.add_parser(
 		"umount",
 		help="Unmount FUSE mounts in the configured workspace.",
