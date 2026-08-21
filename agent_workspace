@@ -128,6 +128,18 @@ class CommandContext:
 	workspace_path: Path
 	config_path: Path
 	agent_config_path: Path
+	branch: str
+
+	@property
+	def workspace(self) -> Path:
+		return self.workspace_path / 'workspaces' / self.branch
+
+	@property
+	def workspace_workdir(self) -> Path:
+		return root_target(self.workspace, self.workdir)
+
+	def with_branch(self, branch: str) -> 'CommandContext':
+		return dataclasses.replace(self, branch=branch)
 
 	@property
 	def post_create_script(self) -> Path:
@@ -309,6 +321,10 @@ def ensure_workspace(context: CommandContext, name: str) -> Path:
 			)
 
 	return final_dir
+
+
+def ensure_context_workspace(context: CommandContext) -> Path:
+	return ensure_workspace(context, context.branch)
 
 
 def parse_mounts(config: dict, source_name: str) -> list[MountSpec]:
@@ -632,21 +648,21 @@ def mount_overlay(workspace: Path, mount: MountSpec) -> None:
 	)
 
 
-def mount_sys_root(context: CommandContext, workspace: Path) -> None:
-	sys_root = sys_root_dir(workspace)
+def mount_sys_root(context: CommandContext) -> None:
+	sys_root = sys_root_dir(context.workspace)
 	sys_root.mkdir(parents=True, exist_ok=True)
 	if not is_mounted(sys_root):
 		bindfs_mount_path(Path('/'), sys_root)
 
 	agent_workdirs = agent_home() / 'workdirs'
-	shadow_source = shadow_dir(workspace) / 'workdirs'
-	shadow_target = sys_root_target(workspace, agent_workdirs)
+	shadow_source = shadow_dir(context.workspace) / 'workdirs'
+	shadow_target = sys_root_target(context.workspace, agent_workdirs)
 	shadow_source.mkdir(parents=True, exist_ok=True)
 	if shadow_target.exists() and not is_mounted(shadow_target):
 		bindfs_mount_path(shadow_source, shadow_target)
 
-	workdir_source = root_target(workspace, context.workdir)
-	workdir_target = sys_root_target(workspace, context.workdir)
+	workdir_source = context.workspace_workdir
+	workdir_target = sys_root_target(context.workspace, context.workdir)
 	if not workdir_source.exists():
 		raise CommandError(f"workspace workdir is not mounted: {workdir_source}", return_code=1)
 	if not workdir_target.exists():
@@ -655,23 +671,23 @@ def mount_sys_root(context: CommandContext, workspace: Path) -> None:
 		bindfs_mount_path(workdir_source, workdir_target)
 
 
-def prepare_workspace_root(context: CommandContext, workspace: Path) -> Path:
-	root = root_dir(workspace)
+def prepare_workspace_root(context: CommandContext) -> Path:
+	root = root_dir(context.workspace)
 	root.mkdir(parents=True, exist_ok=True)
 
 	for mount in configured_mounts(context):
 		if mount.flag == 'o':
-			mount_overlay(workspace, mount)
-	mount_sys_root(context, workspace)
+			mount_overlay(context.workspace, mount)
+	mount_sys_root(context)
 
 	return root
 
 
-def bwrap_mount_args(context: CommandContext, workspace: Path) -> list[str]:
+def bwrap_mount_args(context: CommandContext) -> list[str]:
 	entries = []
 	for mount in configured_mounts(context):
 		if mount.flag == 'o':
-			src = root_target(workspace, mount.dst)
+			src = root_target(context.workspace, mount.dst)
 			if src.exists():
 				entries.append(('--bind', src, mount.dst))
 		elif mount.src.exists():
@@ -685,11 +701,11 @@ def bwrap_mount_args(context: CommandContext, workspace: Path) -> list[str]:
 	return args
 
 
-def run_pre_enter(context: CommandContext, workspace: Path, branch: str) -> None:
+def run_pre_enter(context: CommandContext) -> None:
 	result = subprocess.run(
-		[str(context.pre_enter_script), str(workspace), branch],
+		[str(context.pre_enter_script), str(context.workspace), context.branch],
 		check=False,
-		env=workspace_script_env(branch, workspace),
+		env=workspace_script_env(context.branch, context.workspace),
 	)
 	if result.returncode != 0:
 		raise CommandError(
@@ -698,11 +714,11 @@ def run_pre_enter(context: CommandContext, workspace: Path, branch: str) -> None
 		)
 
 
-def run_pre_remove(context: CommandContext, workspace: Path, branch: str) -> None:
+def run_pre_remove(context: CommandContext) -> None:
 	result = subprocess.run(
 		[str(context.pre_remove_script)],
 		check=False,
-		env=workspace_script_env(branch, workspace),
+		env=workspace_script_env(context.branch, context.workspace),
 	)
 	if result.returncode != 0:
 		raise CommandError(
@@ -752,17 +768,18 @@ def get_shell_command() -> list[str]:
 	return ['/bin/sh']
 
 
-def enter_workspace_shell(final_dir: Path, branch: str) -> int:
+def enter_workspace_shell(context: CommandContext) -> int:
 	command = get_shell_command()
-	return enter_workspace_command(final_dir, branch, command)
+	return enter_workspace_command(context, command)
 
 
-def enter_workspace_command(final_dir: Path, branch: str, command: list[str]) -> int:
+def enter_workspace_command(context: CommandContext, command: list[str]) -> int:
 	if not command:
 		raise CommandError("command must not be empty", return_code=2)
 
+	final_dir = context.workspace_workdir
 	env = os.environ.copy()
-	env['AGENT_BRANCH'] = branch
+	env['AGENT_BRANCH'] = context.branch
 	env['PWD'] = str(final_dir)
 
 	os.chdir(final_dir)
@@ -770,10 +787,10 @@ def enter_workspace_command(final_dir: Path, branch: str, command: list[str]) ->
 	raise AssertionError("os.execvpe returned unexpectedly")
 
 
-def bwrap_env(context: CommandContext, workdir: Path, branch: str) -> dict[str, str]:
+def bwrap_env(context: CommandContext) -> dict[str, str]:
 	env = {
-		'AGENT_BRANCH': branch,
-		'PWD': str(workdir),
+		'AGENT_BRANCH': context.branch,
+		'PWD': str(context.workdir),
 	}
 	for env_name in ('HOME', 'USER', 'LOGNAME', 'SHELL', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM'):
 		if env_name in os.environ:
@@ -793,7 +810,7 @@ def shell_quote_args(args: list[str]) -> str:
 	return ' '.join(shlex.quote(item) for item in args)
 
 
-def vm_log_path(context: CommandContext, workspace: Path) -> Path:
+def vm_log_path(context: CommandContext) -> Path:
 	log_dir = Path(os.environ.get('AGENT_VM_LOG_DIR', str(context.workdir / '.agent_vm')))
 	log_basename = os.environ.get(
 		'AGENT_VM_LOG_BASENAME',
@@ -801,7 +818,7 @@ def vm_log_path(context: CommandContext, workspace: Path) -> Path:
 	)
 	log_path = log_dir / f'{log_basename}.krun.log'
 	if log_dir.is_absolute() and log_dir.is_relative_to(context.workdir):
-		mapped_log_path = root_target(workspace, log_path)
+		mapped_log_path = root_target(context.workspace, log_path)
 		mapped_log_path.parent.mkdir(parents=True, exist_ok=True)
 		mapped_log_path.write_text('', encoding='utf-8')
 	else:
@@ -824,12 +841,12 @@ def setpriv_command() -> list[str]:
 	return command
 
 
-def chroot_vm_command(context: CommandContext, workspace: Path, workdir: Path, command: list[str], env: dict[str, str]) -> list[str]:
+def chroot_vm_command(context: CommandContext, command: list[str], env: dict[str, str]) -> list[str]:
 	vm_command = ['env', '-i', *[f'{key}={value}' for key, value in env.items()], *command]
-	shell_command = f'cd {shlex.quote(str(workdir))} && exec {shell_quote_args(vm_command)}'
+	shell_command = f'cd {shlex.quote(str(context.workdir))} && exec {shell_quote_args(vm_command)}'
 	return [
 		'chroot_vm',
-		f'--log={vm_log_path(context, workspace)}',
+		f'--log={vm_log_path(context)}',
 		'/',
 		*setpriv_command(),
 		'/bin/sh',
@@ -851,9 +868,6 @@ def bwrap_dev_args(vm: bool) -> list[str]:
 
 def bwrap_command(
 	context: CommandContext,
-	workspace: Path,
-	workdir: Path,
-	branch: str,
 	command: list[str],
 	network: NetworkConfig,
 	extra_options: list[str] | None = None,
@@ -869,11 +883,11 @@ def bwrap_command(
 	]
 	if not network.isolated:
 		args.append('--share-net')
-	env = bwrap_env(context, workdir, branch)
-	command = chroot_vm_command(context, workspace, workdir, command, env) if vm else command
+	env = bwrap_env(context)
+	command = chroot_vm_command(context, command, env) if vm else command
 	args.extend(
 		[
-			*bwrap_mount_args(context, workspace),
+			*bwrap_mount_args(context),
 			'--proc',
 			'/proc',
 			*bwrap_dev_args(vm),
@@ -881,7 +895,7 @@ def bwrap_command(
 			'/tmp',
 			'--clearenv',
 			'--chdir',
-			str(workdir),
+			str(context.workdir),
 			*bwrap_env_args(env),
 			*(extra_options or []),
 			'--',
@@ -893,20 +907,17 @@ def bwrap_command(
 
 def enter_bwrap_command(
 	context: CommandContext,
-	workspace: Path,
-	workdir: Path,
-	branch: str,
 	command: list[str],
 	network: NetworkConfig,
 	extra_options: list[str] | None = None,
 	vm: bool = False,
 ) -> int:
 	if network.isolated:
-		return run_isolated_bwrap(context, workspace, workdir, branch, command, network, extra_options=extra_options, vm=vm)
+		return run_isolated_bwrap(context, command, network, extra_options=extra_options, vm=vm)
 
 	os.execvpe(
 		'bwrap',
-		bwrap_command(context, workspace, workdir, branch, command, network, extra_options=extra_options, vm=vm),
+		bwrap_command(context, command, network, extra_options=extra_options, vm=vm),
 		os.environ.copy(),
 	)
 	raise AssertionError("os.execvpe returned unexpectedly")
@@ -989,9 +1000,6 @@ def wait_for_pasta_start(pasta: subprocess.Popen) -> None:
 
 def run_isolated_bwrap(
 	context: CommandContext,
-	workspace: Path,
-	workdir: Path,
-	branch: str,
 	command: list[str],
 	network: NetworkConfig,
 	extra_options: list[str] | None = None,
@@ -1001,9 +1009,6 @@ def run_isolated_bwrap(
 	block_read_fd, block_write_fd = os.pipe()
 	bwrap_args = bwrap_command(
 		context,
-		workspace,
-		workdir,
-		branch,
 		command,
 		network,
 		extra_options=[
@@ -1071,12 +1076,16 @@ def configured_branch(config: dict) -> str:
 	return branch
 
 
-def current_branch(context: CommandContext) -> str:
+def resolve_context_branch(args: argparse.Namespace, config_path: Path) -> str:
+	configured_arg_branch = getattr(args, 'branch', None)
+	if configured_arg_branch:
+		return configured_arg_branch
+
 	configured_agent_branch = os.environ.get('AGENT_BRANCH')
 	if configured_agent_branch:
 		return configured_agent_branch
 
-	config = read_toml_file(context.config_path)
+	config = read_toml_file(config_path)
 	return configured_branch(config)
 
 
@@ -1088,23 +1097,18 @@ def subagent_branch(branch: str, name: str) -> str:
 
 
 def command_cd(context: CommandContext) -> int:
-	branch = current_branch(context)
-	workspace = ensure_workspace(context, branch)
-	prepare_workspace_root(context, workspace)
-	run_pre_enter(context, workspace, branch)
-	return enter_workspace_shell(root_target(workspace, context.workdir), branch)
+	ensure_context_workspace(context)
+	prepare_workspace_root(context)
+	run_pre_enter(context)
+	return enter_workspace_shell(context)
 
 
 def command_shell(context: CommandContext) -> int:
-	branch = current_branch(context)
-	workspace = ensure_workspace(context, branch)
-	prepare_workspace_root(context, workspace)
-	run_pre_enter(context, workspace, branch)
+	ensure_context_workspace(context)
+	prepare_workspace_root(context)
+	run_pre_enter(context)
 	return enter_bwrap_command(
 		context,
-		workspace,
-		context.workdir,
-		branch,
 		get_shell_command(),
 		configured_network(context, isolated=not context.args.shared_network, verbose=context.args.verbose),
 		extra_options=['--new-session'] if context.args.vm else None,
@@ -1122,15 +1126,11 @@ def parsed_exec_command(context: CommandContext) -> list[str]:
 
 def command_exec(context: CommandContext) -> int:
 	command = parsed_exec_command(context)
-	branch = current_branch(context)
-	workspace = ensure_workspace(context, branch)
-	prepare_workspace_root(context, workspace)
-	run_pre_enter(context, workspace, branch)
+	ensure_context_workspace(context)
+	prepare_workspace_root(context)
+	run_pre_enter(context)
 	return enter_bwrap_command(
 		context,
-		workspace,
-		context.workdir,
-		branch,
 		command,
 		configured_network(context, isolated=not context.args.shared_network),
 		extra_options=['--new-session'],
@@ -1143,29 +1143,28 @@ def command_subagent(context: CommandContext) -> int:
 	if not command:
 		raise CommandError("subagent command is required", return_code=2)
 
-	branch = subagent_branch(current_branch(context), context.args.name)
-	workspace = ensure_workspace(context, branch)
-	prepare_workspace_root(context, workspace)
-	run_pre_enter(context, workspace, branch)
-	return enter_bwrap_command(context, workspace, context.workdir, branch, command, configured_network(context))
+	subcontext = context.with_branch(subagent_branch(context.branch, context.args.name))
+	ensure_context_workspace(subcontext)
+	prepare_workspace_root(subcontext)
+	run_pre_enter(subcontext)
+	return enter_bwrap_command(subcontext, command, configured_network(subcontext))
 
 
 def command_activate(context: CommandContext) -> int:
-	branch = current_branch(context)
-	workspace = ensure_workspace(context, branch)
+	ensure_context_workspace(context)
 	active_branch = active_workspace_branch(context)
 	if active_branch is not None:
 		active_branch_name, _ = active_branch
-		if active_branch_name == branch:
+		if active_branch_name == context.branch:
 			return 0
 		raise CommandError(
 			f"workspace branch {active_branch_name!r} is already active at {context.workdir}",
 			return_code=1,
 		)
 
-	prepare_workspace_root(context, workspace)
-	run_pre_enter(context, workspace, branch)
-	bindfs_mount_path(root_target(workspace, context.workdir), context.workdir)
+	prepare_workspace_root(context)
+	run_pre_enter(context)
+	bindfs_mount_path(context.workspace_workdir, context.workdir)
 	return 0
 
 
@@ -1178,9 +1177,7 @@ def command_deactivate(context: CommandContext) -> int:
 
 
 def command_umount(context: CommandContext) -> int:
-	branch = current_branch(context)
-	workspace = context.workspace_path / 'workspaces' / branch
-	unmount_workspace(workspace)
+	unmount_workspace(context.workspace)
 
 	return 0
 
@@ -1199,17 +1196,15 @@ def unmount_workspace(workspace: Path) -> None:
 
 
 def command_rm(context: CommandContext) -> int:
-	branch = current_branch(context)
-	workspace = context.workspace_path / 'workspaces' / branch
-	if not workspace.exists():
-		raise CommandError(f"workspace does not exist: {workspace}", return_code=1)
+	if not context.workspace.exists():
+		raise CommandError(f"workspace does not exist: {context.workspace}", return_code=1)
 
 	if not context.args.yes:
-		confirm_remove_workspace(workspace, branch)
+		confirm_remove_workspace(context.workspace, context.branch)
 
-	run_pre_remove(context, workspace, branch)
-	unmount_workspace(workspace)
-	shutil.rmtree(workspace)
+	run_pre_remove(context)
+	unmount_workspace(context.workspace)
+	shutil.rmtree(context.workspace)
 	return 0
 
 
@@ -1224,7 +1219,7 @@ def command_ls(context: CommandContext) -> int:
 	status_width = len("unmounted")
 	current_marker_width = len("(*)")
 	current_workdir_hash = workdir_hash(context.workdir)
-	current_branch_name = current_branch(context)
+	current_branch_name = context.branch
 	workdirs_path = agent_home() / 'workdirs'
 
 	sys.stdout.write(f'{colorize(str(workdirs_path), label_color, use_color)}\n\n')
@@ -1287,6 +1282,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 	subparsers = parser.add_subparsers(dest='command', required=True)
 
+	def add_branch_dir_arguments(command_parser: argparse.ArgumentParser) -> None:
+		command_parser.add_argument(
+			"-b",
+			"--branch",
+			help="Branch to use instead of config branch.",
+		)
+		command_parser.add_argument(
+			"-d",
+			"--dir",
+			help="Workdir to use instead of default working directory.",
+		)
+
 	configure_parser = subparsers.add_parser(
 		"configure",
 		help="Open or update this workdir's config.toml.",
@@ -1298,14 +1305,16 @@ def build_parser() -> argparse.ArgumentParser:
 		help="Set this workdir's branch.",
 	)
 	branch_parser.add_argument("name", help="Branch name to set.")
-	subparsers.add_parser(
+	cd_parser = subparsers.add_parser(
 		"cd",
 		help="Create or select the configured workspace and start a host shell in root/<workdir>.",
 	)
+	add_branch_dir_arguments(cd_parser)
 	shell_parser = subparsers.add_parser(
 		"shell",
 		help="Create or select the configured workspace and start a bwrap shell.",
 	)
+	add_branch_dir_arguments(shell_parser)
 	shell_parser.add_argument(
 		'--shared-network',
 		action='store_true',
@@ -1358,6 +1367,7 @@ def build_parser() -> argparse.ArgumentParser:
 		"rm",
 		help="Run workspace_pre_remove, unmount, and remove the current branch workspace.",
 	)
+	add_branch_dir_arguments(rm_parser)
 	rm_parser.add_argument(
 		"--yes",
 		action='store_true',
@@ -1379,14 +1389,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
 	args = build_parser().parse_args(argv)
-	workdir = resolve_workdir(args.workdir)
+	workdir = resolve_workdir(getattr(args, 'dir', None) or args.workdir)
 	workspace_path, config_path, agent_config = ensure_workspace_config(workdir)
+	branch = resolve_context_branch(args, config_path)
 	context = CommandContext(
 		args=args,
 		workdir=workdir,
 		workspace_path=workspace_path,
 		config_path=config_path,
 		agent_config_path=agent_config,
+		branch=branch,
 	)
 
 	command = COMMAND_TABLE[args.command]
@@ -1395,6 +1407,7 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == '__main__':
 	try:
+		os.environ.pop('FAKECHROOT_BASE', None)
 		sys.exit(main())
 	except CommandError as exc:
 		sys.stderr.write(f"agent_workspace: error: {exc}\n")
