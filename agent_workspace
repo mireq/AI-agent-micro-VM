@@ -1384,6 +1384,7 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == '__main__':
 	try:
+		os.environ.pop('FAKECHROOT_BASE', None)
 		sys.exit(main())
 	except CommandError as exc:
 		sys.stderr.write(f"agent_workspace: error: {exc}\n")
