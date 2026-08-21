@@ -138,9 +138,6 @@ class CommandContext:
 	def workspace_workdir(self) -> Path:
 		return root_target(self.workspace, self.workdir)
 
-	def with_branch(self, branch: str) -> 'CommandContext':
-		return dataclasses.replace(self, branch=branch)
-
 	@property
 	def post_create_script(self) -> Path:
 		return self.workspace_path / 'scripts' / 'workspace_post_create'
@@ -1143,7 +1140,14 @@ def command_subagent(context: CommandContext) -> int:
 	if not command:
 		raise CommandError("subagent command is required", return_code=2)
 
-	subcontext = context.with_branch(subagent_branch(context.branch, context.args.name))
+	subcontext = CommandContext(
+		args=context.args,
+		workdir=context.workdir,
+		workspace_path=context.workspace_path,
+		config_path=context.config_path,
+		agent_config_path=context.agent_config_path,
+		branch=subagent_branch(context.branch, context.args.name),
+	)
 	ensure_context_workspace(subcontext)
 	prepare_workspace_root(subcontext)
 	run_pre_enter(subcontext)
@@ -1359,10 +1363,11 @@ def build_parser() -> argparse.ArgumentParser:
 		"deactivate",
 		help="Unmount an active workspace bindfs mount from the project workdir.",
 	)
-	subparsers.add_parser(
+	umount_parser = subparsers.add_parser(
 		"umount",
 		help="Unmount FUSE mounts in the configured workspace.",
 	)
+	add_branch_dir_arguments(umount_parser)
 	rm_parser = subparsers.add_parser(
 		"rm",
 		help="Run workspace_pre_remove, unmount, and remove the current branch workspace.",
