@@ -436,6 +436,10 @@ def root_dir(workspace: Path) -> Path:
 	return workspace / 'root'
 
 
+def sys_root_dir(workspace: Path) -> Path:
+	return workspace / 'sys_root'
+
+
 def overlay_dir(workspace: Path, mount_dst: Path) -> Path:
 	relative_dst = mount_dst.relative_to('/')
 	if str(relative_dst) == '.':
@@ -446,6 +450,10 @@ def overlay_dir(workspace: Path, mount_dst: Path) -> Path:
 
 def root_target(workspace: Path, mount_dst: Path) -> Path:
 	return root_dir(workspace) / mount_dst.relative_to('/')
+
+
+def sys_root_target(workspace: Path, mount_dst: Path) -> Path:
+	return sys_root_dir(workspace) / mount_dst.relative_to('/')
 
 
 def decode_mountinfo_path(value: str) -> str:
@@ -620,6 +628,22 @@ def mount_overlay(workspace: Path, mount: MountSpec) -> None:
 	)
 
 
+def mount_sys_root(context: CommandContext, workspace: Path) -> None:
+	sys_root = sys_root_dir(workspace)
+	sys_root.mkdir(parents=True, exist_ok=True)
+	if not is_mounted(sys_root):
+		bindfs_mount_path(Path('/'), sys_root)
+
+	workdir_source = root_target(workspace, context.workdir)
+	workdir_target = sys_root_target(workspace, context.workdir)
+	if not workdir_source.exists():
+		raise CommandError(f"workspace workdir is not mounted: {workdir_source}", return_code=1)
+	if not workdir_target.exists():
+		raise CommandError(f"sys_root workdir target does not exist: {workdir_target}", return_code=1)
+	if not is_mounted(workdir_target):
+		bindfs_mount_path(workdir_source, workdir_target)
+
+
 def prepare_workspace_root(context: CommandContext, workspace: Path) -> Path:
 	root = root_dir(workspace)
 	root.mkdir(parents=True, exist_ok=True)
@@ -627,6 +651,7 @@ def prepare_workspace_root(context: CommandContext, workspace: Path) -> Path:
 	for mount in configured_mounts(context):
 		if mount.flag == 'o':
 			mount_overlay(workspace, mount)
+	mount_sys_root(context, workspace)
 
 	return root
 
