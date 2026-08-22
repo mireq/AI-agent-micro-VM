@@ -16,7 +16,7 @@ import tomllib
 from pathlib import Path
 
 
-DEFAULT_WORKDIR_CONFIG = 'branch = "main"\n'
+DEFAULT_WORKDIR_CONFIG = ''
 DEFAULT_AGENT_CONFIG = '''[[mount]]
 flag = "r"
 src = "/usr"
@@ -104,6 +104,7 @@ dst = "/etc/man_db.conf"
 '''
 DEFAULT_SCRIPT = '#!/usr/bin/env bash\n'
 WORKSPACE_SEPARATOR = '__'
+NONE_WORKSPACE_NAME = '__none__'
 VALID_MOUNT_FLAGS = frozenset(('r', 'w', 'o'))
 DEFAULT_NET_PROTOCOL = 'tcp'
 VALID_NET_ALLOW_RULES = frozenset(('host_connect_sandbox', 'sandbox_connect_host'))
@@ -128,14 +129,20 @@ class CommandContext:
 	workspace_path: Path
 	config_path: Path
 	agent_config_path: Path
-	branch: str
+	branch: str | None
 
 	@property
 	def workspace(self) -> Path:
-		return self.workspace_path / 'workspaces' / self.branch
+		return self.workspace_path / 'workspaces' / self.workspace_name
+
+	@property
+	def workspace_name(self) -> str:
+		return self.branch or NONE_WORKSPACE_NAME
 
 	@property
 	def workspace_workdir(self) -> Path:
+		if self.branch is None:
+			return self.workdir
 		return root_target(self.workspace, self.workdir)
 
 	@property
@@ -321,7 +328,14 @@ def ensure_workspace(context: CommandContext, name: str) -> Path:
 
 
 def ensure_context_workspace(context: CommandContext) -> Path:
-	return ensure_workspace(context, context.branch)
+	return ensure_workspace(context, context.workspace_name)
+
+
+def require_branch(context: CommandContext) -> str:
+	if context.branch is None:
+		raise CommandError("branch is not configured", return_code=2)
+
+	return context.branch
 
 
 def parse_mounts(config: dict, source_name: str) -> list[MountSpec]:
@@ -356,7 +370,11 @@ def parse_mounts(config: dict, source_name: str) -> list[MountSpec]:
 def configured_mounts(context: CommandContext) -> list[MountSpec]:
 	mounts = parse_mounts(read_toml_file(context.agent_config_path), str(context.agent_config_path))
 	mounts.extend(parse_mounts(read_toml_file(context.config_path), str(context.config_path)))
-	mounts.append(MountSpec(flag='o', src=context.workdir, dst=context.workdir))
+	if context.branch is None:
+		mounts = [mount for mount in mounts if mount.flag != 'o']
+		mounts.append(MountSpec(flag='w', src=context.workdir, dst=context.workdir))
+	else:
+		mounts.append(MountSpec(flag='o', src=context.workdir, dst=context.workdir))
 	return remove_duplicate_mounts(mounts)
 
 
@@ -700,9 +718,9 @@ def bwrap_mount_args(context: CommandContext) -> list[str]:
 
 def run_pre_enter(context: CommandContext) -> None:
 	result = subprocess.run(
-		[str(context.pre_enter_script), str(context.workspace), context.branch],
+		[str(context.pre_enter_script), str(context.workspace), context.workspace_name],
 		check=False,
-		env=workspace_script_env(context.branch, context.workspace),
+		env=workspace_script_env(context.workspace_name, context.workspace),
 	)
 	if result.returncode != 0:
 		raise CommandError(
@@ -715,7 +733,7 @@ def run_pre_remove(context: CommandContext) -> None:
 	result = subprocess.run(
 		[str(context.pre_remove_script)],
 		check=False,
-		env=workspace_script_env(context.branch, context.workspace),
+		env=workspace_script_env(context.workspace_name, context.workspace),
 	)
 	if result.returncode != 0:
 		raise CommandError(
@@ -776,7 +794,7 @@ def enter_workspace_command(context: CommandContext, command: list[str]) -> int:
 
 	final_dir = context.workspace_workdir
 	env = os.environ.copy()
-	env['AGENT_BRANCH'] = context.branch
+	env['AGENT_BRANCH'] = context.workspace_name
 	env['PWD'] = str(final_dir)
 
 	os.chdir(final_dir)
@@ -786,7 +804,7 @@ def enter_workspace_command(context: CommandContext, command: list[str]) -> int:
 
 def bwrap_env(context: CommandContext) -> dict[str, str]:
 	env = {
-		'AGENT_BRANCH': context.branch,
+		'AGENT_BRANCH': context.workspace_name,
 		'PWD': str(context.workdir),
 	}
 	for env_name in ('HOME', 'USER', 'LOGNAME', 'SHELL', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM'):
@@ -1065,15 +1083,17 @@ def command_branch(context: CommandContext) -> int:
 	return 0
 
 
-def configured_branch(config: dict) -> str:
+def configured_branch(config: dict) -> str | None:
 	branch = config.get('branch')
+	if branch is None:
+		return None
 	if not isinstance(branch, str) or not branch:
 		raise CommandError("config field 'branch' must be a non-empty string", return_code=2)
 
 	return branch
 
 
-def resolve_context_branch(args: argparse.Namespace, config_path: Path) -> str:
+def resolve_context_branch(args: argparse.Namespace, config_path: Path) -> str | None:
 	configured_arg_branch = getattr(args, 'branch', None)
 	if configured_arg_branch:
 		return configured_arg_branch
@@ -1086,23 +1106,27 @@ def resolve_context_branch(args: argparse.Namespace, config_path: Path) -> str:
 	return configured_branch(config)
 
 
-def subagent_branch(branch: str, name: str) -> str:
+def subagent_branch(branch: str | None, name: str) -> str:
 	if not name:
 		raise CommandError("subagent name must not be empty", return_code=2)
+	if branch is None:
+		return name
 
 	return f"{branch}{WORKSPACE_SEPARATOR}{name}"
 
 
 def command_cd(context: CommandContext) -> int:
 	ensure_context_workspace(context)
-	prepare_workspace_root(context)
+	if context.branch is not None:
+		prepare_workspace_root(context)
 	run_pre_enter(context)
 	return enter_workspace_shell(context)
 
 
 def command_shell(context: CommandContext) -> int:
 	ensure_context_workspace(context)
-	prepare_workspace_root(context)
+	if context.branch is not None:
+		prepare_workspace_root(context)
 	run_pre_enter(context)
 	return enter_bwrap_command(
 		context,
@@ -1124,7 +1148,8 @@ def parsed_exec_command(context: CommandContext) -> list[str]:
 def command_exec(context: CommandContext) -> int:
 	command = parsed_exec_command(context)
 	ensure_context_workspace(context)
-	prepare_workspace_root(context)
+	if context.branch is not None:
+		prepare_workspace_root(context)
 	run_pre_enter(context)
 	return enter_bwrap_command(
 		context,
@@ -1155,6 +1180,7 @@ def command_subagent(context: CommandContext) -> int:
 
 
 def command_activate(context: CommandContext) -> int:
+	require_branch(context)
 	ensure_context_workspace(context)
 	active_branch = active_workspace_branch(context)
 	if active_branch is not None:
@@ -1204,7 +1230,7 @@ def command_rm(context: CommandContext) -> int:
 		raise CommandError(f"workspace does not exist: {context.workspace}", return_code=1)
 
 	if not context.args.yes:
-		confirm_remove_workspace(context.workspace, context.branch)
+		confirm_remove_workspace(context.workspace, context.workspace_name)
 
 	run_pre_remove(context)
 	unmount_workspace(context.workspace)
@@ -1223,7 +1249,7 @@ def command_ls(context: CommandContext) -> int:
 	status_width = len("unmounted")
 	current_marker_width = len("(*)")
 	current_workdir_hash = workdir_hash(context.workdir)
-	current_branch_name = context.branch
+	current_branch_name = context.workspace_name
 	workdirs_path = agent_home() / 'workdirs'
 
 	sys.stdout.write(f'{colorize(str(workdirs_path), label_color, use_color)}\n\n')
