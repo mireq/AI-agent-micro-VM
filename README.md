@@ -203,6 +203,9 @@ CI = true
 `[env]` from the global config is loaded first. `[env]` from the project config
 overrides global values.
 
+`AGENT_BRANCH` is set inside `shell`, `exec`, and `cd` only when a real branch
+is selected. No-branch mode leaves it unset for the command environment.
+
 ## Network
 
 Network isolation is enabled by default for `shell`, `exec`, and `subagent`.
@@ -234,6 +237,9 @@ Rules:
 - `host_connect_sandbox`: host connects to a selected sandbox localhost port
 
 Only TCP is supported.
+
+VM mode uses `passt` for isolated networking so configured
+`host_connect_sandbox` port mappings also expose services running inside the VM.
 
 Print network setup details:
 
@@ -300,6 +306,11 @@ ${AGENT_VM_LOG_DIR:-$PWD/.agent_vm}/<timestamp-and-pid>.krun.log
 ```
 
 `AGENT_VM_LOG_BASENAME` can override the generated log basename.
+`AGENT_VM_LOG_DIR` must resolve inside the project workdir so the log path is
+visible to `chroot_vm` from inside the bwrap environment.
+In isolated VM mode, `AGENT_VM_PASST_BIN_DIR` can override the generated
+`passt` wrapper directory. The directory must also resolve inside the project
+workdir.
 
 ## Security Notes
 

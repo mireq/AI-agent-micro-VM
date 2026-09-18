@@ -109,6 +109,9 @@ VALID_MOUNT_FLAGS = frozenset(('r', 'w', 'o'))
 DEFAULT_NET_PROTOCOL = 'tcp'
 VALID_NET_ALLOW_RULES = frozenset(('host_connect_sandbox', 'sandbox_connect_host'))
 VM_LOG_TIMESTAMP_FORMAT = '%Y%m%dT%H%M%SZ'
+VM_PASST_ADDRESS = '10.0.2.100'
+VM_PASST_GATEWAY = '10.0.2.2'
+VM_PASST_NETMASK = '255.255.255.0'
 WORKSPACE_SCRIPTS = (
 	'workspace_post_create',
 	'workspace_pre_enter',
@@ -794,7 +797,7 @@ def enter_workspace_command(context: CommandContext, command: list[str]) -> int:
 
 	final_dir = context.workspace_workdir
 	env = os.environ.copy()
-	env['AGENT_BRANCH'] = context.workspace_name
+	set_agent_branch_env(env, context)
 	env['PWD'] = str(final_dir)
 
 	os.chdir(final_dir)
@@ -802,15 +805,22 @@ def enter_workspace_command(context: CommandContext, command: list[str]) -> int:
 	raise AssertionError("os.execvpe returned unexpectedly")
 
 
+def set_agent_branch_env(env: dict[str, str], context: CommandContext) -> None:
+	if context.branch is None:
+		env.pop('AGENT_BRANCH', None)
+	else:
+		env['AGENT_BRANCH'] = context.branch
+
+
 def bwrap_env(context: CommandContext) -> dict[str, str]:
 	env = {
-		'AGENT_BRANCH': context.workspace_name,
 		'PWD': str(context.workdir),
 	}
 	for env_name in ('HOME', 'USER', 'LOGNAME', 'SHELL', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM'):
 		if env_name in os.environ:
 			env[env_name] = os.environ[env_name]
 	env.update(configured_env(context))
+	set_agent_branch_env(env, context)
 	return env
 
 
@@ -832,15 +842,80 @@ def vm_log_path(context: CommandContext) -> Path:
 		f'{datetime.datetime.now(datetime.UTC).strftime(VM_LOG_TIMESTAMP_FORMAT)}-{os.getpid()}',
 	)
 	log_path = log_dir / f'{log_basename}.krun.log'
-	if log_dir.is_absolute() and log_dir.is_relative_to(context.workdir):
+	if not log_path.is_absolute():
+		log_path = context.workdir / log_path
+	if not log_path.is_relative_to(context.workdir):
+		raise CommandError(
+			f"VM log path must be inside the project workdir: {log_path}",
+			return_code=2,
+		)
+
+	if context.branch is None:
+		log_path.parent.mkdir(parents=True, exist_ok=True)
+		log_path.write_text('', encoding='utf-8')
+	else:
 		mapped_log_path = root_target(context.workspace, log_path)
 		mapped_log_path.parent.mkdir(parents=True, exist_ok=True)
 		mapped_log_path.write_text('', encoding='utf-8')
-	else:
-		log_dir.mkdir(parents=True, exist_ok=True)
-		log_path.write_text('', encoding='utf-8')
 
 	return log_path
+
+
+def vm_status_path(context: CommandContext) -> Path:
+	status_dir = context.workdir / '.agent_vm'
+	status_path = status_dir / f'{datetime.datetime.now(datetime.UTC).strftime(VM_LOG_TIMESTAMP_FORMAT)}-{os.getpid()}.status'
+	if context.branch is None:
+		status_path.parent.mkdir(parents=True, exist_ok=True)
+		try:
+			status_path.unlink()
+		except FileNotFoundError:
+			pass
+	else:
+		mapped_status_path = root_target(context.workspace, status_path)
+		mapped_status_path.parent.mkdir(parents=True, exist_ok=True)
+		try:
+			mapped_status_path.unlink()
+		except FileNotFoundError:
+			pass
+
+	return status_path
+
+
+def vm_host_path(context: CommandContext, path: Path) -> Path:
+	if context.branch is None:
+		return path
+
+	return root_target(context.workspace, path)
+
+
+def read_vm_status(context: CommandContext, status_path: Path | None) -> int | None:
+	if status_path is None:
+		return None
+
+	host_status_path = vm_host_path(context, status_path)
+	try:
+		raw_status = host_status_path.read_text(encoding='utf-8').strip()
+	except FileNotFoundError:
+		return None
+
+	try:
+		return int(raw_status)
+	except ValueError:
+		return None
+
+
+def vm_shell_command(context: CommandContext, command: list[str], env: dict[str, str], status_path: Path | None) -> str:
+	vm_command = ['env', '-i', *[f'{key}={value}' for key, value in env.items()], *command]
+	run_command = shell_quote_args(vm_command)
+	if status_path is None:
+		return f'cd {shlex.quote(str(context.workdir))} && exec {run_command}'
+
+	return (
+		f'cd {shlex.quote(str(context.workdir))} && {run_command}; '
+		'status=$?; '
+		f'printf %s "$status" > {shlex.quote(str(status_path))}; '
+		'exit "$status"'
+	)
 
 
 def setpriv_command() -> list[str]:
@@ -856,9 +931,13 @@ def setpriv_command() -> list[str]:
 	return command
 
 
-def chroot_vm_command(context: CommandContext, command: list[str], env: dict[str, str]) -> list[str]:
-	vm_command = ['env', '-i', *[f'{key}={value}' for key, value in env.items()], *command]
-	shell_command = f'cd {shlex.quote(str(context.workdir))} && exec {shell_quote_args(vm_command)}'
+def chroot_vm_command(
+	context: CommandContext,
+	command: list[str],
+	env: dict[str, str],
+	status_path: Path | None = None,
+) -> list[str]:
+	shell_command = vm_shell_command(context, command, env, status_path)
 	return [
 		'chroot_vm',
 		f'--log={vm_log_path(context)}',
@@ -870,15 +949,51 @@ def chroot_vm_command(context: CommandContext, command: list[str], env: dict[str
 	]
 
 
+def chroot_vm_passt_command(
+	context: CommandContext,
+	command: list[str],
+	env: dict[str, str],
+	network: NetworkConfig,
+	status_path: Path | None = None,
+) -> list[str]:
+	user_shell_command = vm_shell_command(context, command, env, status_path)
+	network_commands = [
+		'ip link set eth0 up',
+		f'ip addr add {VM_PASST_ADDRESS}/24 dev eth0 2>/dev/null || true',
+		f'ip route add default via {VM_PASST_GATEWAY} dev eth0 2>/dev/null || true',
+	]
+	for forward in network.forwards:
+		if forward.allow == 'sandbox_connect_host':
+			network_commands.append(
+				f'socat TCP-LISTEN:{forward.sandbox_port},bind=127.0.0.1,reuseaddr,fork '
+				f'TCP:{VM_PASST_GATEWAY}:{forward.host_port} & true'
+			)
+	network_commands.append('exec ' + shell_quote_args([*setpriv_command(), '/bin/sh', '-lc', user_shell_command]))
+	return [
+		'chroot_vm',
+		f'--log={vm_log_path(context)}',
+		'--net=PASST',
+		'/',
+		'/bin/sh',
+		'-lc',
+		'; '.join(network_commands),
+	]
+
+
 def bwrap_dev_args(vm: bool) -> list[str]:
+	args = ['--dev', '/dev']
+	tun_path = Path('/dev/net/tun')
+	if tun_path.exists():
+		args.extend(['--dev-bind', str(tun_path), str(tun_path)])
+
 	if vm:
 		kvm_path = Path('/dev/kvm')
 		if not kvm_path.exists():
 			raise CommandError("VM mode requires /dev/kvm", return_code=1)
 
-		return ['--dev', '/dev', '--dev-bind', str(kvm_path), str(kvm_path)]
+		args.extend(['--dev-bind', str(kvm_path), str(kvm_path)])
 
-	return ['--dev', '/dev']
+	return args
 
 
 def bwrap_command(
@@ -887,19 +1002,32 @@ def bwrap_command(
 	network: NetworkConfig,
 	extra_options: list[str] | None = None,
 	vm: bool = False,
+	vm_passt_path: Path | None = None,
+	vm_status_path: Path | None = None,
 ) -> list[str]:
 	if not command:
 		raise CommandError("command must not be empty", return_code=2)
+	if vm_passt_path is not None and not vm:
+		raise CommandError("VM passt path is only valid in VM mode", return_code=1)
 
 	args = [
 		'bwrap',
 		'--unshare-all',
 		'--die-with-parent',
 	]
-	if not network.isolated:
+	if not network.isolated or vm:
 		args.append('--share-net')
 	env = bwrap_env(context)
-	command = chroot_vm_command(context, command, env) if vm else command
+	chroot_env = env
+	if vm_passt_path is not None:
+		chroot_env = env.copy()
+		chroot_env['PATH'] = f'{vm_passt_path}:{env.get("PATH", "/usr/bin:/bin")}'
+	if vm:
+		command = (
+			chroot_vm_passt_command(context, command, env, network, vm_status_path)
+			if vm_passt_path is not None
+			else chroot_vm_command(context, command, env, vm_status_path)
+		)
 	args.extend(
 		[
 			*bwrap_mount_args(context),
@@ -911,7 +1039,7 @@ def bwrap_command(
 			'--clearenv',
 			'--chdir',
 			str(context.workdir),
-			*bwrap_env_args(env),
+			*bwrap_env_args(chroot_env),
 			*(extra_options or []),
 			'--',
 			*command,
@@ -957,20 +1085,29 @@ def pasta_port_spec(forward: NetForward) -> str:
 	return f'{forward.sandbox_port}:{forward.host_port}'
 
 
-def pasta_command(child_pid: int, network: NetworkConfig) -> list[str]:
+def passt_port_spec(forward: NetForward) -> str:
+	return f'127.0.0.1/{forward.host_port}:{forward.sandbox_port}'
+
+
+def vm_needs_passt(network: NetworkConfig) -> bool:
+	return any(forward.allow == 'host_connect_sandbox' for forward in network.forwards)
+
+
+def pasta_command(child_pid: int, network: NetworkConfig, host_loopback_to_namespace_loopback: bool = True) -> list[str]:
 	host_connect_sandbox = [forward for forward in network.forwards if forward.allow == 'host_connect_sandbox']
-	sandbox_connect_host = [forward for forward in network.forwards if forward.allow == 'sandbox_connect_host']
 	command = [
 		'pasta',
 		'--foreground',
 		'--config-net',
+		'--ipv4-only',
 		'--no-map-gw',
 		'--udp-ports',
 		'none',
 		'--udp-ns',
 		'none',
-		'--host-lo-to-ns-lo',
 	]
+	if host_loopback_to_namespace_loopback:
+		command.append('--host-lo-to-ns-lo')
 	if not network.verbose:
 		command.append('--quiet')
 
@@ -990,14 +1127,78 @@ def pasta_command(child_pid: int, network: NetworkConfig) -> list[str]:
 	return command
 
 
-def start_pasta(child_pid: int, network: NetworkConfig) -> subprocess.Popen:
+def bwrap_visible_host_path(context: CommandContext, path: Path) -> Path:
+	if context.branch is None:
+		return path
+
+	return root_target(context.workspace, path)
+
+
+def vm_passt_bin_path(context: CommandContext) -> tuple[Path, Path]:
+	bin_path = Path(os.environ.get('AGENT_VM_PASST_BIN_DIR', str(context.workdir / '.agent_vm' / 'bin')))
+	if not bin_path.is_absolute():
+		bin_path = context.workdir / bin_path
+	if not bin_path.is_relative_to(context.workdir):
+		raise CommandError(
+			f"VM passt wrapper path must be inside the project workdir: {bin_path}",
+			return_code=2,
+		)
+
+	return bin_path, bwrap_visible_host_path(context, bin_path)
+
+
+def passt_wrapper_command(network: NetworkConfig) -> list[str]:
+	host_connect_sandbox = [forward for forward in network.forwards if forward.allow == 'host_connect_sandbox']
+	command = [
+		'/usr/bin/passt',
+		'--address',
+		VM_PASST_ADDRESS,
+		'--netmask',
+		VM_PASST_NETMASK,
+		'--gateway',
+		VM_PASST_GATEWAY,
+		'--ipv4-only',
+		'--no-map-gw',
+		'--udp-ports',
+		'none',
+	]
+	if any(forward.allow == 'sandbox_connect_host' for forward in network.forwards):
+		command.remove('--no-map-gw')
+		command.extend(['--map-host-loopback', VM_PASST_GATEWAY])
+	if not network.verbose:
+		command.append('--quiet')
+
+	if host_connect_sandbox:
+		for forward in host_connect_sandbox:
+			command.extend(['--tcp-ports', passt_port_spec(forward)])
+	else:
+		command.extend(['--tcp-ports', 'none'])
+
+	return command
+
+
+def vm_outer_network(network: NetworkConfig) -> NetworkConfig:
+	return NetworkConfig(isolated=network.isolated, verbose=network.verbose, forwards=[])
+
+
+def write_vm_passt_wrapper(context: CommandContext, network: NetworkConfig) -> Path:
+	bin_path, host_bin_path = vm_passt_bin_path(context)
+	host_bin_path.mkdir(parents=True, exist_ok=True)
+	host_wrapper_path = host_bin_path / 'passt'
+	wrapper_command = shell_quote_args(passt_wrapper_command(network))
+	host_wrapper_path.write_text(f'#!/bin/sh\nexec {wrapper_command} "$@"\n', encoding='utf-8')
+	host_wrapper_path.chmod(0o755)
+
+	return bin_path
+
+
+def start_pasta(child_pid: int, network: NetworkConfig, vm: bool = False) -> subprocess.Popen:
 	return subprocess.Popen(
-		pasta_command(child_pid, network),
+		pasta_command(child_pid, network, host_loopback_to_namespace_loopback=not vm),
 		close_fds=True,
 		stdout=None if network.verbose else subprocess.DEVNULL,
 		stderr=None if network.verbose else subprocess.PIPE,
 	)
-
 
 def wait_for_pasta_start(pasta: subprocess.Popen) -> None:
 	time.sleep(0.25)
@@ -1013,6 +1214,18 @@ def wait_for_pasta_start(pasta: subprocess.Popen) -> None:
 	raise CommandError(message, return_code=pasta.returncode or 1)
 
 
+def terminate_process(process: subprocess.Popen) -> None:
+	if process.poll() is not None:
+		return
+
+	process.terminate()
+	try:
+		process.wait(timeout=5)
+	except subprocess.TimeoutExpired:
+		process.kill()
+		process.wait()
+
+
 def run_isolated_bwrap(
 	context: CommandContext,
 	command: list[str],
@@ -1022,6 +1235,9 @@ def run_isolated_bwrap(
 ) -> int:
 	status_read_fd, status_write_fd = os.pipe()
 	block_read_fd, block_write_fd = os.pipe()
+	use_vm_passt = vm and vm_needs_passt(network)
+	vm_passt_path = write_vm_passt_wrapper(context, network) if use_vm_passt else None
+	status_path = vm_status_path(context) if vm else None
 	bwrap_args = bwrap_command(
 		context,
 		command,
@@ -1034,6 +1250,8 @@ def run_isolated_bwrap(
 			str(block_read_fd),
 		],
 		vm=vm,
+		vm_passt_path=vm_passt_path,
+		vm_status_path=status_path,
 	)
 	bwrap = subprocess.Popen(
 		bwrap_args,
@@ -1046,11 +1264,15 @@ def run_isolated_bwrap(
 	pasta = None
 	try:
 		child_pid = read_bwrap_child_pid(status_read_fd)
-		pasta = start_pasta(child_pid, network)
-		wait_for_pasta_start(pasta)
+		passt_vm = vm and use_vm_passt
+		if not vm:
+			pasta = start_pasta(child_pid, network)
+			wait_for_pasta_start(pasta)
 		os.close(block_write_fd)
 		block_write_fd = None
-		return bwrap.wait()
+		bwrap_status = bwrap.wait()
+		vm_status = read_vm_status(context, status_path)
+		return vm_status if vm_status is not None else bwrap_status
 	except Exception:
 		bwrap.terminate()
 		try:
@@ -1062,10 +1284,7 @@ def run_isolated_bwrap(
 		if block_write_fd is not None:
 			os.close(block_write_fd)
 		if pasta is not None:
-			try:
-				pasta.wait(timeout=5)
-			except subprocess.TimeoutExpired:
-				pasta.terminate()
+			terminate_process(pasta)
 
 
 def command_configure(context: CommandContext) -> int:
@@ -1099,7 +1318,7 @@ def resolve_context_branch(args: argparse.Namespace, config_path: Path) -> str |
 		return configured_arg_branch
 
 	configured_agent_branch = os.environ.get('AGENT_BRANCH')
-	if configured_agent_branch:
+	if configured_agent_branch and configured_agent_branch != NONE_WORKSPACE_NAME:
 		return configured_agent_branch
 
 	config = read_toml_file(config_path)
