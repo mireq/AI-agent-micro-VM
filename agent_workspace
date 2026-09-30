@@ -11,9 +11,11 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from pathlib import Path
+from typing import IO, cast
 
 
 DEFAULT_WORKDIR_CONFIG = ''
@@ -955,6 +957,7 @@ def chroot_vm_passt_command(
 	env: dict[str, str],
 	network: NetworkConfig,
 	status_path: Path | None = None,
+	setup_script_path: Path | None = None,
 ) -> list[str]:
 	user_shell_command = vm_shell_command(context, command, env, status_path)
 	network_commands = [
@@ -969,6 +972,15 @@ def chroot_vm_passt_command(
 				f'TCP:{VM_PASST_GATEWAY}:{forward.host_port} & true'
 			)
 	network_commands.append('exec ' + shell_quote_args([*setpriv_command(), '/bin/sh', '-lc', user_shell_command]))
+	if setup_script_path is not None:
+		return [
+			'chroot_vm',
+			f'--log={vm_log_path(context)}',
+			'--net=PASST',
+			'/',
+			'/bin/sh',
+			str(setup_script_path),
+		]
 	return [
 		'chroot_vm',
 		f'--log={vm_log_path(context)}',
@@ -1004,6 +1016,7 @@ def bwrap_command(
 	vm: bool = False,
 	vm_passt_path: Path | None = None,
 	vm_status_path: Path | None = None,
+	vm_setup_script_path: Path | None = None,
 ) -> list[str]:
 	if not command:
 		raise CommandError("command must not be empty", return_code=2)
@@ -1024,7 +1037,14 @@ def bwrap_command(
 		chroot_env['PATH'] = f'{vm_passt_path}:{env.get("PATH", "/usr/bin:/bin")}'
 	if vm:
 		command = (
-			chroot_vm_passt_command(context, command, env, network, vm_status_path)
+			chroot_vm_passt_command(
+				context,
+				command,
+				env,
+				network,
+				vm_status_path,
+				vm_setup_script_path,
+			)
 			if vm_passt_path is not None
 			else chroot_vm_command(context, command, env, vm_status_path)
 		)
@@ -1036,6 +1056,11 @@ def bwrap_command(
 			*bwrap_dev_args(vm),
 			'--tmpfs',
 			'/tmp',
+			*([
+				'--ro-bind',
+				str(vm_setup_script_path),
+				str(vm_setup_script_path),
+			] if vm_setup_script_path is not None else []),
 			'--clearenv',
 			'--chdir',
 			str(context.workdir),
@@ -1090,11 +1115,14 @@ def passt_port_spec(forward: NetForward) -> str:
 
 
 def vm_needs_passt(network: NetworkConfig) -> bool:
-	return any(forward.allow == 'host_connect_sandbox' for forward in network.forwards)
+	# Keep VM workloads off libkrun TSI. TSI proxy cleanup can hang under
+	# browser workloads with many short-lived network connections.
+	return True
 
 
 def pasta_command(child_pid: int, network: NetworkConfig, host_loopback_to_namespace_loopback: bool = True) -> list[str]:
 	host_connect_sandbox = [forward for forward in network.forwards if forward.allow == 'host_connect_sandbox']
+	sandbox_connect_host = [forward for forward in network.forwards if forward.allow == 'sandbox_connect_host']
 	command = [
 		'pasta',
 		'--foreground',
@@ -1192,6 +1220,44 @@ def write_vm_passt_wrapper(context: CommandContext, network: NetworkConfig) -> P
 	return bin_path
 
 
+def write_vm_network_setup_script(
+	context: CommandContext,
+	command: list[str],
+	env: dict[str, str],
+	network: NetworkConfig,
+	status_path: Path | None,
+) -> tuple[Path, IO[str]]:
+	network_commands = [
+		'#!/bin/sh',
+		'ip link set eth0 up',
+		f'ip addr add {VM_PASST_ADDRESS}/24 dev eth0 2>/dev/null || true',
+		f'ip route add default via {VM_PASST_GATEWAY} dev eth0 2>/dev/null || true',
+	]
+	for forward in network.forwards:
+		if forward.allow == 'sandbox_connect_host':
+			network_commands.append(
+				f'socat TCP-LISTEN:{forward.sandbox_port},bind=127.0.0.1,reuseaddr,fork '
+				f'TCP:{VM_PASST_GATEWAY}:{forward.host_port} & true'
+			)
+	network_commands.append('exec ' + shell_quote_args([*setpriv_command(), '/bin/sh', '-lc', vm_shell_command(context, command, env, status_path)]))
+	script_file = tempfile.NamedTemporaryFile(
+		mode='w',
+		encoding='utf-8',
+		suffix='.sh',
+		delete=True,
+	)
+	script_file.write('\n'.join(network_commands) + '\n')
+	script_file.flush()
+	return Path(script_file.name), cast(IO[str], script_file)
+
+
+def close_vm_network_setup_script(script_file: tuple[Path, IO[str]] | None) -> None:
+	if script_file is None:
+		return
+
+	script_file[1].close()
+
+
 def start_pasta(child_pid: int, network: NetworkConfig, vm: bool = False) -> subprocess.Popen:
 	return subprocess.Popen(
 		pasta_command(child_pid, network, host_loopback_to_namespace_loopback=not vm),
@@ -1238,26 +1304,36 @@ def run_isolated_bwrap(
 	use_vm_passt = vm and vm_needs_passt(network)
 	vm_passt_path = write_vm_passt_wrapper(context, network) if use_vm_passt else None
 	status_path = vm_status_path(context) if vm else None
-	bwrap_args = bwrap_command(
-		context,
-		command,
-		network,
-		extra_options=[
-			*(extra_options or []),
-			'--json-status-fd',
-			str(status_write_fd),
-			'--block-fd',
-			str(block_read_fd),
-		],
-		vm=vm,
-		vm_passt_path=vm_passt_path,
-		vm_status_path=status_path,
+	vm_setup_script_paths = (
+		write_vm_network_setup_script(context, command, bwrap_env(context), network, status_path)
+		if use_vm_passt
+		else None
 	)
-	bwrap = subprocess.Popen(
-		bwrap_args,
-		pass_fds=(status_write_fd, block_read_fd),
-		close_fds=True,
-	)
+	try:
+		bwrap_args = bwrap_command(
+			context,
+			command,
+			network,
+			extra_options=[
+				*(extra_options or []),
+				'--json-status-fd',
+				str(status_write_fd),
+				'--block-fd',
+				str(block_read_fd),
+			],
+			vm=vm,
+			vm_passt_path=vm_passt_path,
+			vm_status_path=status_path,
+			vm_setup_script_path=vm_setup_script_paths[0] if vm_setup_script_paths is not None else None,
+		)
+		bwrap = subprocess.Popen(
+			bwrap_args,
+			pass_fds=(status_write_fd, block_read_fd),
+			close_fds=True,
+		)
+	except Exception:
+		close_vm_network_setup_script(vm_setup_script_paths)
+		raise
 	os.close(status_write_fd)
 	os.close(block_read_fd)
 
@@ -1281,6 +1357,7 @@ def run_isolated_bwrap(
 			bwrap.kill()
 		raise
 	finally:
+		close_vm_network_setup_script(vm_setup_script_paths)
 		if block_write_fd is not None:
 			os.close(block_write_fd)
 		if pasta is not None:
