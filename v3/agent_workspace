@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+NESTED_ENV = 'AGENT_WORKSPACE_NESTED'
+
+
+class CommandError(RuntimeError):
+	def __init__(self, message: str, return_code: int = 1) -> None:
+		super().__init__(message)
+		self.return_code = return_code
+
+
+@dataclass
+class CommandContext:
+	args: argparse.Namespace
+	project_path: Path
+
+
+def build_bwrap_args(
+	command: list[str],
+	extra_options: list[str] | None = None,
+):
+	args = [
+		'bwrap',
+		'--unshare-all',
+		'--die-with-parent',
+		'--ro-bind', '/', '/',
+		*(extra_options or []),
+		'--',
+		*command,
+	]
+	return args
+
+
+def build_pasta_command(bwrap_command: list[str]):
+	command = [
+		'pasta',
+		'--foreground',
+		'--config-net',
+		'--ipv4-only',
+		'--no-map-gw',
+		'--udp-ports',
+		'none',
+		'--udp-ns',
+		'none',
+		'--host-lo-to-ns-lo',
+		'--quiet',
+		'--',
+		*bwrap_command,
+	]
+	return command
+
+
+def command_exec(context: CommandContext):
+	command = context.args.command[1:]
+	bwrap_args = build_bwrap_args(
+		command,
+		extra_options=['--share-net'],
+	)
+
+	if context.args.shared_network:
+		return subprocess.call(bwrap_args)
+
+	return subprocess.call(build_pasta_command(bwrap_args))
+
+
+COMMAND_TABLE = {
+	'exec': command_exec,
+}
+
+
+def workdir_slug(path: Path) -> str:
+	text = str(path)
+	home = str(Path.home())
+	if text == home:
+		text = "~"
+	elif text.startswith(home + "/"):
+		text = "~" + text[len(home):]
+	readable = re.sub(r"[^A-Za-z0-9._~-]+", "-", text).strip("-") or "special"
+	readable = readable[:120].rstrip("-") or "special"
+	digest = hashlib.sha256(str(path).encode()).hexdigest()[:8]
+	return f"{readable}-{digest}"
+
+
+def workdir_hash(workdir: Path) -> str:
+	return hashlib.sha256(str(workdir).encode('utf-8')).hexdigest()
+
+
+def build_argument_parser():
+	parser = argparse.ArgumentParser(description="Manage agent workspace")
+	subparsers = parser.add_subparsers(dest='tool', required=True)
+	exec_parser = subparsers.add_parser(
+		"exec",
+		help="Run a command in the configured workspace with bwrap.",
+	)
+	exec_parser.add_argument(
+		'--shared-network',
+		action='store_true',
+		help="Share host networking instead of using isolated networking.",
+	)
+	exec_parser.add_argument(
+		'--vm',
+		action='store_true',
+		help="Run the command through chroot_vm.",
+	)
+	exec_parser.add_argument('command', nargs=argparse.REMAINDER, help="Use -- followed by command and arguments.")
+	return parser
+
+
+def main():
+	parser = build_argument_parser()
+	args = parser.parse_args()
+	context = CommandContext(
+		args=args,
+		project_path=Path(os.getcwd()).expanduser().resolve(),
+	)
+	command = COMMAND_TABLE[args.tool]
+	return command(context)
+
+
+if __name__ == '__main__':
+	try:
+		sys.exit(main())
+	except CommandError as exc:
+		sys.stderr.write(f"agent_workspace: error: {exc}\n")
+		sys.exit(exc.return_code)
