@@ -11,6 +11,89 @@ from pathlib import Path
 
 NESTED_ENV = 'AGENT_WORKSPACE_NESTED'
 
+DEFAULT_AGENT_CONFIG = '''[[mount]]
+flag = "r"
+src = "/usr"
+dst = "/usr"
+
+[[mount]]
+flag = "r"
+src = "/bin"
+dst = "/bin"
+
+[[mount]]
+flag = "r"
+src = "/lib"
+dst = "/lib"
+
+[[mount]]
+flag = "r"
+src = "/lib64"
+dst = "/lib64"
+
+[[mount]]
+flag = "r"
+src = "/opt"
+dst = "/opt"
+
+[[mount]]
+flag = "r"
+src = "/etc/passwd"
+dst = "/etc/passwd"
+
+[[mount]]
+flag = "r"
+src = "/etc/group"
+dst = "/etc/group"
+
+[[mount]]
+flag = "r"
+src = "/etc/nsswitch.conf"
+dst = "/etc/nsswitch.conf"
+
+[[mount]]
+flag = "r"
+src = "/etc/hosts"
+dst = "/etc/hosts"
+
+[[mount]]
+flag = "r"
+src = "/etc/resolv.conf"
+dst = "/etc/resolv.conf"
+
+[[mount]]
+flag = "r"
+src = "/etc/ld.so.cache"
+dst = "/etc/ld.so.cache"
+
+[[mount]]
+flag = "r"
+src = "/etc/ld.so.conf"
+dst = "/etc/ld.so.conf"
+
+[[mount]]
+flag = "r"
+src = "/etc/ld.so.conf.d"
+dst = "/etc/ld.so.conf.d"
+
+[[mount]]
+flag = "r"
+src = "/etc/localtime"
+dst = "/etc/localtime"
+
+[[mount]]
+flag = "r"
+src = "/etc/ssl"
+dst = "/etc/ssl"
+
+[[mount]]
+flag = "r"
+src = "/etc/pki"
+dst = "/etc/pki"
+'''
+DEFAULT_WORKSPACE_CONFIG = ''
+SCRIPTS = ('workspace_post_create', 'workspace_pre_enter', 'workspace_pre_remove')
+
 
 class CommandError(RuntimeError):
 	def __init__(self, message: str, return_code: int = 1) -> None:
@@ -22,6 +105,7 @@ class CommandError(RuntimeError):
 class CommandContext:
 	args: argparse.Namespace
 	project_path: Path
+	legacy_workspace: bool
 
 
 def build_bwrap_args(
@@ -40,7 +124,7 @@ def build_bwrap_args(
 	return args
 
 
-def build_pasta_command(bwrap_command: list[str]):
+def build_pasta_args(bwrap_command: list[str]):
 	command = [
 		'pasta',
 		'--foreground',
@@ -60,16 +144,22 @@ def build_pasta_command(bwrap_command: list[str]):
 
 
 def command_exec(context: CommandContext):
-	command = context.args.command[1:]
-	bwrap_args = build_bwrap_args(
+	args = context.args
+	command =args.command[1:]
+
+	extra_options = []
+	if args.shared_network:
+		extra_options += ['--share-net']
+
+	wrapped_args = build_bwrap_args(
 		command,
-		extra_options=['--share-net'],
+		extra_options=extra_options
 	)
 
-	if context.args.shared_network:
-		return subprocess.call(bwrap_args)
+	if not context.args.shared_network:
+		wrapped_args = build_pasta_args(wrapped_args)
 
-	return subprocess.call(build_pasta_command(bwrap_args))
+	return subprocess.call(wrapped_args)
 
 
 COMMAND_TABLE = {
@@ -77,7 +167,11 @@ COMMAND_TABLE = {
 }
 
 
-def workdir_slug(path: Path) -> str:
+def agent_home() -> Path:
+	return Path(os.environ.get('AGENT_HOME', '~/.agent')).expanduser()
+
+
+def workspace_slug(path: Path) -> str:
 	text = str(path)
 	home = str(Path.home())
 	if text == home:
@@ -90,12 +184,20 @@ def workdir_slug(path: Path) -> str:
 	return f"{readable}-{digest}"
 
 
-def workdir_hash(workdir: Path) -> str:
-	return hashlib.sha256(str(workdir).encode('utf-8')).hexdigest()
+def workspace_hash(path: Path) -> str:
+	return hashlib.sha256(str(path).encode('utf-8')).hexdigest()
+
+
+def workspace_data_name(path: Path, legacy: bool) -> str:
+	return workspace_hash(path) if legacy else workspace_slug(path)
 
 
 def build_argument_parser():
 	parser = argparse.ArgumentParser(description="Manage agent workspace")
+	parser.add_argument(
+		'--legacy-workspace',
+		help="Use legacy workspace dir instead of new with slug.",
+	)
 	subparsers = parser.add_subparsers(dest='tool', required=True)
 	exec_parser = subparsers.add_parser(
 		"exec",
@@ -115,13 +217,40 @@ def build_argument_parser():
 	return parser
 
 
+def make_context(args: argparse.Namespace) -> CommandContext:
+	project_path = Path(os.getcwd()).expanduser().resolve()
+	home = agent_home()
+	home.mkdir(parents=True, exist_ok=True)
+	agent_config = home / 'config.toml'
+	if not agent_config.exists():
+		agent_config.write_text(DEFAULT_AGENT_CONFIG, encoding='utf-8')
+	project_workspace = home / 'workspaces' / workspace_data_name(project_path, args.legacy_workspace)
+	project_workspace.mkdir(parents=True, exist_ok=True)
+	project_config = project_workspace / 'config.toml'
+	if not project_config.exists():
+		project_config.write_text(DEFAULT_WORKSPACE_CONFIG, encoding='utf-8')
+	initialize_scripts(project_workspace)
+	context = CommandContext(
+		args=args,
+		project_path=project_path,
+		legacy_workspace=bool(args.legacy_workspace),
+	)
+	return context
+
+
+def initialize_scripts(path: Path) -> None:
+	path.joinpath('scripts').mkdir(parents=True, exist_ok=True)
+	for name in SCRIPTS:
+		path = path / 'scripts' / name
+		if not path.exists():
+			path.write_text('#!/usr/bin/env bash\n', encoding='utf-8')
+		path.chmod(0o755)
+
+
 def main():
 	parser = build_argument_parser()
 	args = parser.parse_args()
-	context = CommandContext(
-		args=args,
-		project_path=Path(os.getcwd()).expanduser().resolve(),
-	)
+	context = make_context(args)
 	command = COMMAND_TABLE[args.tool]
 	return command(context)
 
