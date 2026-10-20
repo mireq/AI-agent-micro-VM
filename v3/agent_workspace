@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -102,10 +103,24 @@ class CommandError(RuntimeError):
 
 
 @dataclass
+class Configuration:
+	mounts: list[tuple[str, Path, Path]]
+	host_connect_sandbox_ports: list[str]
+	sandbox_connect_host_ports: list[str]
+
+
+@dataclass
 class CommandContext:
 	args: argparse.Namespace
 	project_path: Path
 	legacy_workspace: bool
+	sub_workspace: str | None
+	configuration: Configuration
+
+
+def check_worktree_name(name: str):
+	if not re.fullmatch(r'[A-Za-z0-9._-]+', name):
+		raise CommandError(f"invalid workspace name: {name!r}")
 
 
 def build_bwrap_args(
@@ -213,8 +228,71 @@ def build_argument_parser():
 		action='store_true',
 		help="Run the command through chroot_vm.",
 	)
+	exec_parser.add_argument(
+		'--workspace',
+		help="Separate executable sub-directory"
+	)
 	exec_parser.add_argument('command', nargs=argparse.REMAINDER, help="Use -- followed by command and arguments.")
 	return parser
+
+
+def parse_configuration(agent_config: Path, project_config: Path) -> Configuration:
+	mounts: list[tuple[str, Path, Path]] = []
+	host_connect_sandbox_ports: list[str] = []
+	sandbox_connect_host_ports: list[str] = []
+
+	for path in [agent_config, project_config]:
+		try:
+			with path.open("rb") as stream:
+				config = tomllib.load(stream)
+		except tomllib.TOMLDecodeError as exc:
+			raise CommandError(f"invalid mount config {path}: {exc}") from exc
+
+		raw_mounts = config.get("mount", [])
+		if not isinstance(raw_mounts, list):
+			raise CommandError(f"invalid mount config {path}: 'mount' must be an array")
+		mounts: list[tuple[str, Path, Path]] = []
+		for index, item in enumerate(raw_mounts, 1):
+			if not isinstance(item, dict):
+				raise CommandError(f"invalid mount config {path}: mount #{index} must be a table")
+			flag = item.get("flag")
+			source = item.get("src")
+			destination = item.get("dst")
+			if flag not in {"r", "w", "o"}:
+				raise CommandError(f"invalid mount config {path}: mount #{index} has invalid flag")
+			if not isinstance(source, str) or not source.startswith("/"):
+				raise CommandError(f"invalid mount config {path}: mount #{index} src must be absolute")
+			if not isinstance(destination, str) or not destination.startswith("/"):
+				raise CommandError(f"invalid mount config {path}: mount #{index} dst must be absolute")
+			mounts.append((flag, Path(source).expanduser(), Path(os.path.normpath(destination))))
+
+		raw_nets = config.get("net", [])
+		if not isinstance(raw_nets, list):
+			raise CommandError(f"invalid net config {path}: 'net' must be an array")
+
+		for index, item in enumerate(raw_nets, 1):
+			if not isinstance(item, dict) or item.get("protocol", "tcp") != "tcp":
+				raise CommandError(f"invalid TCP network rule #{index}")
+			try:
+				allow = item["allow"]
+				host_port = int(item["host_port"])
+				sandbox_port = int(item["sandbox_port"])
+			except (KeyError, TypeError, ValueError) as exc:
+				raise CommandError(f"invalid network rule #{index}") from exc
+			if not 1 <= host_port <= 65535 or not 1 <= sandbox_port <= 65535:
+				raise CommandError(f"invalid network port in rule #{index}")
+			if allow == "host_connect_sandbox":
+				host_connect_sandbox_ports.append(f"{host_port}:{sandbox_port}")
+			elif allow == "sandbox_connect_host":
+				sandbox_connect_host_ports.append(f"{sandbox_port}:{host_port}")
+			else:
+				raise CommandError(f"invalid network direction in rule #{index}")
+
+	return Configuration(
+		mounts=mounts,
+		host_connect_sandbox_ports=host_connect_sandbox_ports,
+		sandbox_connect_host_ports=sandbox_connect_host_ports
+	)
 
 
 def make_context(args: argparse.Namespace) -> CommandContext:
@@ -230,18 +308,21 @@ def make_context(args: argparse.Namespace) -> CommandContext:
 	if not project_config.exists():
 		project_config.write_text(DEFAULT_WORKSPACE_CONFIG, encoding='utf-8')
 	initialize_scripts(project_workspace)
-	context = CommandContext(
+	sub_workspace = getattr(args, 'workspace', None)
+	configuration = parse_configuration(agent_config, project_config)
+	return CommandContext(
 		args=args,
 		project_path=project_path,
 		legacy_workspace=bool(args.legacy_workspace),
+		sub_workspace=sub_workspace,
+		configuration=configuration,
 	)
-	return context
 
 
-def initialize_scripts(path: Path) -> None:
-	path.joinpath('scripts').mkdir(parents=True, exist_ok=True)
+def initialize_scripts(workspace: Path) -> None:
+	workspace.joinpath('scripts').mkdir(parents=True, exist_ok=True)
 	for name in SCRIPTS:
-		path = path / 'scripts' / name
+		path = workspace / 'scripts' / name
 		if not path.exists():
 			path.write_text('#!/usr/bin/env bash\n', encoding='utf-8')
 		path.chmod(0o755)
