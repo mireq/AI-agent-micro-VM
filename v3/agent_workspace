@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -258,6 +259,18 @@ def setpriv_command() -> list[str]:
 	return command
 
 
+def get_shell_command() -> list[str]:
+	configured_shell = os.environ.get('SHELL')
+	if configured_shell:
+		return shlex.split(configured_shell)
+
+	login_shell = pwd.getpwuid(os.getuid()).pw_shell
+	if login_shell:
+		return [login_shell]
+
+	return ['/bin/sh']
+
+
 def vm_shell_command(context: CommandContext, command: list[str], status_path: Path | None) -> str:
 	vm_command = ['env', '-i', *[f'{key}={value}' for key, value in context.configuration.env.items()], *command]
 	run_command = shlex.join(vm_command)
@@ -302,10 +315,7 @@ def write_vm_run_script(context: CommandContext, command: list[str])-> Path:
 	return Path(script_file.name), cast(IO[str], script_file)
 
 
-def command_exec(context: CommandContext):
-	args = context.args
-	command = args.command[1:]
-
+def run_command(context: CommandContext, command: list[str]):
 	extra_options = []
 
 	vm_run_script = write_vm_run_script(context, command)
@@ -322,6 +332,14 @@ def command_exec(context: CommandContext):
 	return subprocess.call(wrapped_args)
 
 
+def command_exec(context: CommandContext):
+	return run_command(context, context.args.command[1:])
+
+
+def command_shell(context: CommandContext):
+	return run_command(context, get_shell_command())
+
+
 def command_configure(context: CommandContext):
 	editor = os.environ.get('VISUAL') or os.environ.get('EDITOR') or 'vi'
 	return subprocess.call([*shlex.split(editor), str(context.project_workspace / 'config.toml')])
@@ -329,6 +347,7 @@ def command_configure(context: CommandContext):
 
 COMMAND_TABLE = {
 	'exec': command_exec,
+	'shell': command_shell,
 	'configure': command_configure,
 }
 
@@ -372,25 +391,33 @@ def build_argument_parser():
 		help="Use legacy workspace dir instead of new with slug.",
 	)
 	subparsers = parser.add_subparsers(dest='tool', required=True)
+	def add_run_arguments(command_parser):
+		command_parser.add_argument(
+			'--shared-network',
+			action='store_true',
+			help="Share host networking instead of using isolated networking.",
+		)
+		command_parser.add_argument(
+			'--vm',
+			action='store_true',
+			help="Run the command through chroot_vm.",
+		)
+		command_parser.add_argument(
+			'--workspace',
+			help="Separate executable sub-directory"
+		)
+
 	exec_parser = subparsers.add_parser(
 		"exec",
 		help="Run a command in the configured workspace with bwrap.",
 	)
-	exec_parser.add_argument(
-		'--shared-network',
-		action='store_true',
-		help="Share host networking instead of using isolated networking.",
-	)
-	exec_parser.add_argument(
-		'--vm',
-		action='store_true',
-		help="Run the command through chroot_vm.",
-	)
-	exec_parser.add_argument(
-		'--workspace',
-		help="Separate executable sub-directory"
-	)
+	add_run_arguments(exec_parser)
 	exec_parser.add_argument('command', nargs=argparse.REMAINDER, help="Use -- followed by command and arguments.")
+	shell_parser = subparsers.add_parser(
+		"shell",
+		help="Run the configured shell in the workspace with bwrap.",
+	)
+	add_run_arguments(shell_parser)
 	subparsers.add_parser(
 		"configure",
 		help="Edit the project workspace configuration.",
