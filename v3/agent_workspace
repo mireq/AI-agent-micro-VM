@@ -129,6 +129,7 @@ class Configuration:
 class CommandContext:
 	args: argparse.Namespace
 	project_path: Path
+	project_workspace: Path
 	legacy_workspace: bool
 	sub_workspace: str | None
 	configuration: Configuration
@@ -141,6 +142,7 @@ def check_worktree_name(name: str):
 
 
 def build_bwrap_args(
+	context: CommandContext,
 	command: list[str],
 	extra_options: list[str] | None = None,
 ):
@@ -157,15 +159,46 @@ def build_bwrap_args(
 			raise CommandError("VM mode requires /dev/kvm", return_code=1)
 		dev_args.extend(['--dev-bind', str(kvm_path), str(kvm_path)])
 
+	bwrap_mount_args = []
+	for mnt in context.configuration.mounts:
+		flag, src, dst = mnt
+		if not src.exists():
+			continue
+		if flag == 'r':
+			bwrap_mount_args.extend(['--ro-bind', str(src), str(dst)])
+		elif flag == 'w':
+			bwrap_mount_args.extend(['--bind', str(src), str(dst)])
+		elif flag == 'o':
+			bwrap_mount_args.extend(['--overlay-src', str(src), str(dst)])
+		else:
+			raise CommandError(f"invalid mount flag: {flag}", return_code=1)
+
+	if context.sub_workspace is None:
+		bwrap_mount_args.extend(["--bind", str(context.project_path), str(context.project_path)])
+	else:
+		bwrap_mount_args.extend([
+			"--overlay-src", str(context.project_path),
+			'--overlay', str(context.project_workspace / 'workspaces' / context.sub_workspace / 'upper'), str(context.project_workspace / 'workspaces' / context.sub_workspace / 'work'), str(context.project_path),
+		])
+
+	bwrap_env_args = []
+	for key, value in context.configuration.env.items():
+		bwrap_env_args.extend(['--setenv', key, value])
+
 	args = [
 		'bwrap',
 		'--unshare-all',
+		'--share-net',
 		'--die-with-parent',
 		'--proc', '/proc',
 		'--dev', '/dev',
 		*dev_args,
 		'--tmpfs', '/tmp',
-		'--ro-bind', '/', '/',
+		*bwrap_mount_args,
+		'--clearenv',
+		'--chdir',
+		str(context.project_path),
+		*bwrap_env_args,
 		*(extra_options or []),
 		'--',
 		*command,
@@ -209,7 +242,6 @@ def build_pasta_args(bwrap_command: list[str], context: CommandContext, host_loo
 		'--',
 		*bwrap_command,
 	]
-	print(shlex.join(command))
 	return command
 
 
@@ -275,12 +307,11 @@ def command_exec(context: CommandContext):
 	command = args.command[1:]
 
 	extra_options = []
-	if args.shared_network:
-		extra_options += ['--share-net']
 
 	vm_run_script = write_vm_run_script(context, command)
 
 	wrapped_args = build_bwrap_args(
+		context=context,
 		command=command,
 		extra_options=extra_options,
 	)
@@ -382,7 +413,6 @@ def parse_configuration(agent_config: Path, project_config: Path) -> Configurati
 		raw_mounts = config.get("mount", [])
 		if not isinstance(raw_mounts, list):
 			raise CommandError(f"invalid mount config {path}: 'mount' must be an array")
-		mounts: list[tuple[str, Path, Path]] = []
 		for index, item in enumerate(raw_mounts, 1):
 			if not isinstance(item, dict):
 				raise CommandError(f"invalid mount config {path}: mount #{index} must be a table")
@@ -425,7 +455,6 @@ def parse_configuration(agent_config: Path, project_config: Path) -> Configurati
 
 		env.update({str(key): stringify_env_value(value) for key, value in raw_env.items()})
 
-
 	return Configuration(
 		mounts=mounts,
 		host_connect_sandbox_ports=host_connect_sandbox_ports,
@@ -452,7 +481,7 @@ def make_context(args: argparse.Namespace) -> CommandContext:
 	agent_config = home / 'config.toml'
 	if not agent_config.exists():
 		agent_config.write_text(DEFAULT_AGENT_CONFIG, encoding='utf-8')
-	project_workspace = home / 'workspaces' / workspace_data_name(project_path, args.legacy_workspace)
+	project_workspace = home / 'workdirs' / workspace_data_name(project_path, args.legacy_workspace)
 	project_workspace.mkdir(parents=True, exist_ok=True)
 	project_config = project_workspace / 'config.toml'
 	if not project_config.exists():
@@ -465,6 +494,7 @@ def make_context(args: argparse.Namespace) -> CommandContext:
 	return CommandContext(
 		args=args,
 		project_path=project_path,
+		project_workspace=project_workspace,
 		legacy_workspace=bool(args.legacy_workspace),
 		sub_workspace=sub_workspace,
 		configuration=configuration,
@@ -481,13 +511,13 @@ def initialize_scripts(workspace: Path) -> None:
 		path.chmod(0o755)
 
 
-def ensure_sub_workspace(project_path: Path, sub_workspace: str | None):
+def ensure_sub_workspace(project_workspace: Path, sub_workspace: str | None):
 	if sub_workspace is None:
 		return
-	path = project_path / sub_workspace
+	path = project_workspace / 'workspaces' / sub_workspace
 	path.mkdir(mode=0o700, parents=True, exist_ok=True)
-	(path / "upper").mkdir(mode=0o700, exist_ok=True)
-	(path / "work").mkdir(mode=0o700, exist_ok=True)
+	(path / 'upper').mkdir(mode=0o700, exist_ok=True)
+	(path / 'work').mkdir(mode=0o700, exist_ok=True)
 	return path
 
 
@@ -496,7 +526,7 @@ def main():
 	args = parser.parse_args()
 	context = make_context(args)
 	try:
-		ensure_sub_workspace(context.project_path, context.sub_workspace)
+		ensure_sub_workspace(context.project_workspace, context.sub_workspace)
 		command = COMMAND_TABLE[args.tool]
 		return command(context)
 	finally:
