@@ -109,6 +109,7 @@ class Configuration:
 	mounts: list[tuple[str, Path, Path]]
 	host_connect_sandbox_ports: list[str]
 	sandbox_connect_host_ports: list[str]
+	env: dict[str, str]
 
 
 @dataclass
@@ -246,10 +247,20 @@ def build_argument_parser():
 	return parser
 
 
+def stringify_env_value(value: object) -> str:
+	if isinstance(value, bool):
+		return '1' if value else '0'
+	if isinstance(value, (str, int, float)):
+		return str(value)
+
+	raise CommandError(f"Value {value} must be a string, number, or boolean", return_code=2)
+
+
 def parse_configuration(agent_config: Path, project_config: Path) -> Configuration:
 	mounts: list[tuple[str, Path, Path]] = []
 	host_connect_sandbox_ports: list[str] = []
 	sandbox_connect_host_ports: list[str] = []
+	env: dict[str, str] = {}
 
 	for path in [agent_config, project_config]:
 		try:
@@ -298,11 +309,30 @@ def parse_configuration(agent_config: Path, project_config: Path) -> Configurati
 			else:
 				raise CommandError(f"invalid network direction in rule #{index}")
 
+		raw_env = config.get('env', {})
+		if raw_env is not None and  not isinstance(raw_env, dict):
+			raise CommandError(f"{path}: 'env' must be a table", return_code=2)
+
+		env.update({str(key): stringify_env_value(value) for key, value in raw_env.items()})
+
+
 	return Configuration(
 		mounts=mounts,
 		host_connect_sandbox_ports=host_connect_sandbox_ports,
-		sandbox_connect_host_ports=sandbox_connect_host_ports
+		sandbox_connect_host_ports=sandbox_connect_host_ports,
+		env=env,
 	)
+
+
+def update_env(project_path: Path, configuration: Configuration):
+	configuration.env.setdefault('PWD', str(project_path))
+	configuration.env.setdefault('HOME', os.environ.get('HOME', str(Path.home())))
+	configuration.env.setdefault('PATH', os.environ.get('PATH', '/usr/bin:/bin'))
+	configuration.env.setdefault(NESTED_ENV, '1')
+	configuration.env['PATH'] = f'/agent/bin:{configuration.env['PATH']}'
+	for name in ("USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM"):
+		if name in os.environ:
+			configuration.env[name] = os.environ[name]
 
 
 def make_context(args: argparse.Namespace) -> CommandContext:
@@ -320,6 +350,7 @@ def make_context(args: argparse.Namespace) -> CommandContext:
 	initialize_scripts(project_workspace)
 	sub_workspace = getattr(args, 'workspace', None)
 	configuration = parse_configuration(agent_config, project_config)
+	update_env(project_path, configuration)
 	runtime = runtime_dir(project_path, args.legacy_workspace)
 	return CommandContext(
 		args=args,
