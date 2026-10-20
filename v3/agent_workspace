@@ -322,8 +322,14 @@ def command_exec(context: CommandContext):
 	return subprocess.call(wrapped_args)
 
 
+def command_configure(context: CommandContext):
+	editor = os.environ.get('VISUAL') or os.environ.get('EDITOR') or 'vi'
+	return subprocess.call([*shlex.split(editor), str(context.project_workspace / 'config.toml')])
+
+
 COMMAND_TABLE = {
 	'exec': command_exec,
+	'configure': command_configure,
 }
 
 
@@ -385,6 +391,10 @@ def build_argument_parser():
 		help="Separate executable sub-directory"
 	)
 	exec_parser.add_argument('command', nargs=argparse.REMAINDER, help="Use -- followed by command and arguments.")
+	subparsers.add_parser(
+		"configure",
+		help="Edit the project workspace configuration.",
+	)
 	return parser
 
 
