@@ -10,13 +10,17 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import cast, IO
 
 
 NESTED_ENV = 'AGENT_WORKSPACE_NESTED'
+VM_ENV = 'AGENT_WORKSPACE_VM'
+VM_UID_ENV = 'AGENT_WORKSPACE_UID'
+VM_GID_ENV = 'AGENT_WORKSPACE_GID'
+VM_GROUPS_ENV = 'AGENT_WORKSPACE_GROUPS'
 
 DEFAULT_AGENT_CONFIG = '''[[mount]]
 flag = "r"
@@ -136,6 +140,7 @@ class CommandContext:
 	sub_workspace: str | None
 	configuration: Configuration
 	runtime: Path
+	workspace_root: Path | None = None
 
 
 def check_worktree_name(name: str):
@@ -144,7 +149,7 @@ def check_worktree_name(name: str):
 
 
 def build_bwrap_args(
-		context: CommandContext,
+	context: CommandContext,
 	command: list[str],
 	extra_options: list[str] | None = None,
 	vm: bool = False,
@@ -160,10 +165,15 @@ def build_bwrap_args(
 		if not kvm_path.exists():
 			raise CommandError("VM mode requires /dev/kvm", return_code=1)
 		dev_args.extend(['--dev-bind', str(kvm_path), str(kvm_path)])
+		fuse_path = Path('/dev/fuse')
+		if fuse_path.exists():
+			dev_args.extend(['--dev-bind', str(fuse_path), str(fuse_path)])
 
 	bwrap_mount_args = []
 	for mnt in context.configuration.mounts:
 		flag, src, dst = mnt
+		if os.environ.get(VM_ENV) == '1':
+			continue
 		if not src.exists():
 			continue
 		if flag == 'r':
@@ -174,9 +184,15 @@ def build_bwrap_args(
 			bwrap_mount_args.extend(['--overlay-src', str(src), str(dst)])
 		else:
 			raise CommandError(f"invalid mount flag: {flag}", return_code=1)
+	if os.environ.get(VM_ENV) == '1':
+		for path in (Path('/usr'), Path('/bin'), Path('/lib'), Path('/lib64'), Path('/opt'), Path('/etc')):
+			if path.exists():
+				bwrap_mount_args.extend(['--ro-bind-try', str(path), str(path)])
 
 	if context.sub_workspace is None:
 		bwrap_mount_args.extend(["--bind", str(context.project_path), str(context.project_path)])
+	elif context.workspace_root is not None:
+		bwrap_mount_args.extend(["--bind", str(context.workspace_root), str(context.project_path)])
 	else:
 		bwrap_mount_args.extend([
 			"--overlay-src", str(context.project_path),
@@ -186,14 +202,30 @@ def build_bwrap_args(
 	bwrap_env_args = []
 	for key, value in context.configuration.env.items():
 		bwrap_env_args.extend(['--setenv', key, value])
+	bwrap_env_args.extend([
+		'--setenv', 'AGENT_HOME', '/agent/agent-home',
+		'--setenv', 'AGENT_WORKSPACE_COMMAND', '/agent/bin/agent_workspace',
+		'--setenv', NESTED_ENV, '1',
+	])
 	if vm and not context.args.shared_network:
 		bwrap_env_args.extend([
 			'--setenv', 'PATH',
-			f'/runtime:{os.environ.get("PATH", "/usr/bin:/bin")}',
+			f'/runtime:/agent/bin:{os.environ.get("PATH", "/usr/bin:/bin")}',
 		])
 
+	bwrap_command = ['bwrap']
+	if os.environ.get(VM_ENV) == '1':
+		bwrap_command = [
+			'/usr/bin/setpriv',
+			'--reuid', os.environ[VM_UID_ENV],
+			'--regid', os.environ[VM_GID_ENV],
+		]
+		groups = os.environ.get(VM_GROUPS_ENV, '')
+		bwrap_command.extend(['--groups', groups] if groups else ['--clear-groups'])
+		bwrap_command.append('bwrap')
+
 	args = [
-		'bwrap',
+		*bwrap_command,
 		'--unshare-all',
 		*(['--share-net'] if vm or context.args.shared_network else []),
 		'--die-with-parent',
@@ -202,6 +234,11 @@ def build_bwrap_args(
 		*dev_args,
 		'--tmpfs', '/tmp',
 		*bwrap_mount_args,
+		'--dir', '/agent',
+		'--dir', '/agent/bin',
+		'--bind', str(agent_home()), '/agent/agent-home',
+		'--bind', str(Path('/agent/workspaces') if os.environ.get(VM_ENV) == '1' else context.project_workspace / 'workspaces'), '/agent/workspaces',
+		'--ro-bind', str(Path(__file__).resolve()), '/agent/bin/agent_workspace',
 		'--bind', str(context.runtime), '/runtime',
 		'--clearenv',
 		'--chdir',
@@ -314,7 +351,14 @@ def write_vm_run_script(context: CommandContext, command: list[str]) -> Path:
 			f'socat TCP-LISTEN:{forward.sandbox_port},bind=127.0.0.1,reuseaddr,fork '
 			f'TCP:{VM_PASST_GATEWAY}:{forward.host_port} & true'
 		)
-	vm_command = ['env', '-i', *[f'{key}={value}' for key, value in context.configuration.env.items()], *command]
+	vm_environment = dict(context.configuration.env)
+	vm_environment['AGENT_HOME'] = '/agent/agent-home'
+	vm_environment['AGENT_WORKSPACE_COMMAND'] = '/agent/bin/agent_workspace'
+	vm_environment[VM_ENV] = '1'
+	vm_environment[VM_UID_ENV] = str(os.getuid())
+	vm_environment[VM_GID_ENV] = str(os.getgid())
+	vm_environment[VM_GROUPS_ENV] = ','.join(str(group) for group in os.getgroups())
+	vm_command = ['env', '-i', *[f'{key}={value}' for key, value in vm_environment.items()], *command]
 	network_commands.append(
 		f'cd {shlex.quote(str(context.project_path))}'
 		f' && exec {shlex.join(vm_command)}'
@@ -325,7 +369,72 @@ def write_vm_run_script(context: CommandContext, command: list[str]) -> Path:
 	return script_file
 
 
+def mount_workspace_overlay(context: CommandContext) -> tuple[Path, subprocess.Popen[str], Path]:
+	target = context.runtime / 'workspace'
+	target.mkdir()
+	workspace_base = Path('/agent/workspaces') if os.environ.get(VM_ENV) == '1' else context.project_workspace / 'workspaces'
+	workspace = workspace_base / context.sub_workspace
+	fuse_work = workspace / f'.fuse-work-{os.getpid()}'
+	fuse_command = ['fuse-overlayfs']
+	if os.environ.get(VM_ENV) == '1':
+		fuse_work.mkdir(mode=0o700)
+	process = subprocess.Popen(
+		[
+			*fuse_command,
+			'-f',
+			'-o',
+			f'lowerdir={context.project_path},upperdir={workspace / "upper"},workdir={fuse_work}',
+			str(target),
+		],
+		stdout=subprocess.DEVNULL,
+		stderr=subprocess.PIPE,
+		text=True,
+	)
+	for _ in range(100):
+		if any(f' {target} ' in line for line in Path('/proc/self/mountinfo').read_text().splitlines()):
+			return target, process, fuse_work
+		if process.poll() is not None:
+			message = process.stderr.read().strip() if process.stderr else ''
+			raise CommandError(message or 'fuse-overlayfs failed', return_code=process.returncode or 1)
+		time.sleep(0.01)
+	process.terminate()
+	process.wait()
+	raise CommandError('fuse-overlayfs did not mount workspace', return_code=1)
+
+
+def unmount_workspace_overlay(target: Path, process: subprocess.Popen[str], fuse_work: Path) -> None:
+	if process.poll() is None:
+		process.terminate()
+		try:
+			process.wait(timeout=5)
+		except subprocess.TimeoutExpired:
+			process.kill()
+			process.wait()
+	if any(f' {target} ' in line for line in Path('/proc/self/mountinfo').read_text().splitlines()):
+		result = subprocess.run(
+			['fusermount3', '-u', '-z', str(target)],
+			check=False,
+			stderr=subprocess.PIPE,
+			text=True,
+		)
+		if result.returncode != 0:
+			raise CommandError(result.stderr.strip() or f'failed to unmount {target}', return_code=result.returncode)
+	shutil.rmtree(fuse_work, ignore_errors=True)
+
+
 def run_command(context: CommandContext, command: list[str]):
+	workspace_mount = None
+	if os.environ.get(VM_ENV) == '1' and context.sub_workspace is not None:
+		workspace_mount = mount_workspace_overlay(context)
+		context = replace(context, workspace_root=workspace_mount[0])
+	try:
+		return _run_command(context, command)
+	finally:
+		if workspace_mount is not None:
+			unmount_workspace_overlay(*workspace_mount)
+
+
+def _run_command(context: CommandContext, command: list[str]):
 	if context.args.vm:
 		if not Path('/dev/kvm').exists():
 			raise CommandError('VM mode requires /dev/kvm')
@@ -340,12 +449,14 @@ def run_command(context: CommandContext, command: list[str]):
 		return subprocess.call(wrapped_args)
 
 	wrapped_args = build_bwrap_args(context, command)
-	if not context.args.shared_network:
+	if not context.args.shared_network and os.environ.get(VM_ENV) != '1':
 		wrapped_args = build_pasta_args(wrapped_args, context=context)
 	return subprocess.call(wrapped_args)
 
 
 def command_exec(context: CommandContext):
+	if not context.args.command or context.args.command[0] != '--' or len(context.args.command) == 1:
+		raise CommandError('exec requires -- COMMAND [ARGS...]', return_code=2)
 	return run_command(context, context.args.command[1:])
 
 
@@ -538,6 +649,8 @@ def make_context(args: argparse.Namespace) -> CommandContext:
 		project_config.write_text(DEFAULT_WORKSPACE_CONFIG, encoding='utf-8')
 	initialize_scripts(project_workspace)
 	sub_workspace = getattr(args, 'workspace', None)
+	if sub_workspace is not None:
+		check_worktree_name(sub_workspace)
 	configuration = parse_configuration(agent_config, project_config)
 	update_env(project_path, configuration)
 	runtime = runtime_dir(project_path, args.legacy_workspace)
@@ -562,9 +675,11 @@ def initialize_scripts(workspace: Path) -> None:
 
 
 def ensure_sub_workspace(project_workspace: Path, sub_workspace: str | None):
+	workspaces = project_workspace / 'workspaces'
+	workspaces.mkdir(mode=0o700, exist_ok=True)
 	if sub_workspace is None:
 		return
-	path = project_workspace / 'workspaces' / sub_workspace
+	path = workspaces / sub_workspace
 	path.mkdir(mode=0o700, parents=True, exist_ok=True)
 	(path / 'upper').mkdir(mode=0o700, exist_ok=True)
 	(path / 'work').mkdir(mode=0o700, exist_ok=True)
