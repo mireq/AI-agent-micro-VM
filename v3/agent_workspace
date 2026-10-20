@@ -6,8 +6,10 @@ import re
 import subprocess
 import sys
 import tomllib
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+import shutil
 
 
 NESTED_ENV = 'AGENT_WORKSPACE_NESTED'
@@ -116,6 +118,7 @@ class CommandContext:
 	legacy_workspace: bool
 	sub_workspace: str | None
 	configuration: Configuration
+	runtime: Path
 
 
 def check_worktree_name(name: str):
@@ -205,6 +208,13 @@ def workspace_hash(path: Path) -> str:
 
 def workspace_data_name(path: Path, legacy: bool) -> str:
 	return workspace_hash(path) if legacy else workspace_slug(path)
+
+
+def runtime_dir(project_path: Path, legacy_workspace: bool) -> Path:
+	base = Path(os.environ.get('XDG_RUNTIME_DIR', f'/tmp/agent_workspace-{os.getuid()}'))
+	path = Path(tempfile.mkdtemp(prefix=f'{workspace_data_name(project_path, legacy_workspace)}-', dir=base if base.exists() else None))
+	path.chmod(0o700)
+	return path
 
 
 def build_argument_parser():
@@ -310,12 +320,14 @@ def make_context(args: argparse.Namespace) -> CommandContext:
 	initialize_scripts(project_workspace)
 	sub_workspace = getattr(args, 'workspace', None)
 	configuration = parse_configuration(agent_config, project_config)
+	runtime = runtime_dir(project_path, args.legacy_workspace)
 	return CommandContext(
 		args=args,
 		project_path=project_path,
 		legacy_workspace=bool(args.legacy_workspace),
 		sub_workspace=sub_workspace,
 		configuration=configuration,
+		runtime=runtime,
 	)
 
 
@@ -328,12 +340,26 @@ def initialize_scripts(workspace: Path) -> None:
 		path.chmod(0o755)
 
 
+def ensure_sub_workspace(project_path: Path, sub_workspace: str | None):
+	if sub_workspace is None:
+		return
+	path = project_path / sub_workspace
+	path.mkdir(mode=0o700, parents=True, exist_ok=True)
+	(path / "upper").mkdir(mode=0o700, exist_ok=True)
+	(path / "work").mkdir(mode=0o700, exist_ok=True)
+	return path
+
+
 def main():
 	parser = build_argument_parser()
 	args = parser.parse_args()
 	context = make_context(args)
-	command = COMMAND_TABLE[args.tool]
-	return command(context)
+	try:
+		ensure_sub_workspace(context.project_path, context.sub_workspace)
+		command = COMMAND_TABLE[args.tool]
+		return command(context)
+	finally:
+		shutil.rmtree(context.runtime, ignore_errors=True)
 
 
 if __name__ == '__main__':
