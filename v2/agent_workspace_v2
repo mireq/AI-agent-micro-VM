@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+"""Run one agent command in a persistent copy-on-write workspace."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import tomllib
+from pathlib import Path
+
+
+class WorkspaceError(RuntimeError):
+	pass
+
+
+DEFAULT_AGENT_CONFIG = '''[[mount]]
+flag = "r"
+src = "/usr"
+dst = "/usr"
+
+[[mount]]
+flag = "r"
+src = "/bin"
+dst = "/bin"
+
+[[mount]]
+flag = "r"
+src = "/lib"
+dst = "/lib"
+
+[[mount]]
+flag = "r"
+src = "/lib64"
+dst = "/lib64"
+
+[[mount]]
+flag = "r"
+src = "/opt"
+dst = "/opt"
+
+[[mount]]
+flag = "r"
+src = "/etc/passwd"
+dst = "/etc/passwd"
+
+[[mount]]
+flag = "r"
+src = "/etc/group"
+dst = "/etc/group"
+
+[[mount]]
+flag = "r"
+src = "/etc/nsswitch.conf"
+dst = "/etc/nsswitch.conf"
+
+[[mount]]
+flag = "r"
+src = "/etc/hosts"
+dst = "/etc/hosts"
+
+[[mount]]
+flag = "r"
+src = "/etc/resolv.conf"
+dst = "/etc/resolv.conf"
+
+[[mount]]
+flag = "r"
+src = "/etc/ld.so.cache"
+dst = "/etc/ld.so.cache"
+
+[[mount]]
+flag = "r"
+src = "/etc/ld.so.conf"
+dst = "/etc/ld.so.conf"
+
+[[mount]]
+flag = "r"
+src = "/etc/ld.so.conf.d"
+dst = "/etc/ld.so.conf.d"
+
+[[mount]]
+flag = "r"
+src = "/etc/localtime"
+dst = "/etc/localtime"
+
+[[mount]]
+flag = "r"
+src = "/etc/ssl"
+dst = "/etc/ssl"
+
+[[mount]]
+flag = "r"
+src = "/etc/pki"
+dst = "/etc/pki"
+
+[[mount]]
+flag = "r"
+src = "/etc/man_db.conf"
+dst = "/etc/man_db.conf"
+'''
+
+
+MAIN = "main"
+INNER = "AGENT_WORKSPACE_V2_INNER"
+
+
+def launcher_name() -> str:
+	return Path(sys.argv[0]).name
+
+
+def launcher_target() -> Path:
+	return Path("/agent/bin") / launcher_name()
+
+
+def project_path(raw: str | None) -> Path:
+	return Path(raw or os.environ.get("PWD", os.getcwd())).expanduser().resolve()
+
+
+def slug(path: Path) -> str:
+	text = str(path)
+	home = str(Path.home())
+	if text == home:
+		text = "~"
+	elif text.startswith(home + "/"):
+		text = "~" + text[len(home):]
+	readable = re.sub(r"[^A-Za-z0-9._~-]+", "-", text).strip("-") or "special"
+	readable = readable[:120].rstrip("-") or "special"
+	digest = hashlib.sha256(str(path).encode()).hexdigest()[:8]
+	return f"{readable}-{digest}"
+
+
+def registry(project: Path) -> Path:
+	return Path(os.environ.get("AGENT_HOME", "~/.agent")).expanduser() / "workdirs" / slug(project)
+
+
+def agent_home() -> Path:
+	return Path(os.environ.get("AGENT_HOME", "~/.agent")).expanduser()
+
+
+def validate_workspace(name: str) -> str:
+	if name == MAIN:
+		return name
+	if not name or name in {".", ".."} or "/" in name or "\\" in name:
+		raise WorkspaceError(f"invalid workspace name: {name!r}")
+	if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+		raise WorkspaceError(f"invalid workspace name: {name!r}")
+	return name
+
+
+def ensure_registry(project: Path) -> tuple[Path, Path]:
+	root = registry(project)
+	workspaces = root / "workspaces"
+	workspaces.mkdir(mode=0o700, parents=True, exist_ok=True)
+	(root / ".path").write_text(f"{project}\n", encoding="utf-8")
+	agent_config = agent_home() / "config.toml"
+	agent_config.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+	if not agent_config.exists():
+		agent_config.write_text(DEFAULT_AGENT_CONFIG, encoding="utf-8")
+		agent_config.chmod(0o600)
+	workdir_config = root / "config.toml"
+	if not workdir_config.exists():
+		workdir_config.write_text("", encoding="utf-8")
+		workdir_config.chmod(0o600)
+	return root, workspaces
+
+
+def parse_mounts(path: Path) -> list[tuple[str, Path, Path]]:
+	try:
+		with path.open("rb") as stream:
+			config = tomllib.load(stream)
+	except tomllib.TOMLDecodeError as exc:
+		raise WorkspaceError(f"invalid mount config {path}: {exc}") from exc
+	raw_mounts = config.get("mount", [])
+	if not isinstance(raw_mounts, list):
+		raise WorkspaceError(f"invalid mount config {path}: 'mount' must be an array")
+	mounts: list[tuple[str, Path, Path]] = []
+	for index, item in enumerate(raw_mounts, 1):
+		if not isinstance(item, dict):
+			raise WorkspaceError(f"invalid mount config {path}: mount #{index} must be a table")
+		flag = item.get("flag")
+		source = item.get("src")
+		destination = item.get("dst")
+		if flag not in {"r", "w", "o"}:
+			raise WorkspaceError(f"invalid mount config {path}: mount #{index} has invalid flag")
+		if not isinstance(source, str) or not source.startswith("/"):
+			raise WorkspaceError(f"invalid mount config {path}: mount #{index} src must be absolute")
+		if not isinstance(destination, str) or not destination.startswith("/"):
+			raise WorkspaceError(f"invalid mount config {path}: mount #{index} dst must be absolute")
+		mounts.append((flag, Path(source).expanduser(), Path(os.path.normpath(destination))))
+	return mounts
+
+
+def configured_mount_args(root: Path, *, inner: bool = False) -> list[str]:
+	mounts = parse_mounts(agent_home() / "config.toml")
+	mounts.extend(parse_mounts(root / "config.toml"))
+	latest: dict[Path, tuple[str, Path, Path]] = {}
+	for mount in mounts:
+		latest[mount[2]] = mount
+	args: list[str] = []
+	for flag, source, destination in latest.values():
+		if flag == "o" or not source.exists():
+			continue
+		bind_flag = "--ro-bind" if flag == "r" else "--bind"
+		mount_source = destination if inner else source
+		args.extend([bind_flag, str(mount_source), str(destination)])
+	return args
+
+
+def inherited_environment(project: Path) -> dict[str, str]:
+	env = {
+		"PWD": str(project),
+		"HOME": os.environ.get("HOME", str(Path.home())),
+		"PATH": f"/agent/bin:{os.environ.get('PATH', '/usr/bin:/bin')}",
+		"AGENT_HOME": "/agent/agent-home",
+		"AGENT_WORKSPACE_COMMAND": str(launcher_target()),
+	}
+	for name in ("USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM"):
+		if name in os.environ:
+			env[name] = os.environ[name]
+	return env
+
+
+def environment_args(env: dict[str, str]) -> list[str]:
+	args: list[str] = []
+	for name, value in env.items():
+		args.extend(["--setenv", name, value])
+	return args
+
+
+def overlay_args(project: Path, workspaces: Path, workspace: str) -> list[str]:
+	if workspace == MAIN:
+		return []
+	state = workspaces / workspace
+	return [
+		"--overlay-src", str(project),
+		"--overlay", str(state / "upper"), str(state / "work"),
+		f"/agent/workspaces/{workspace}",
+	]
+
+
+def network_forwards(root: Path) -> tuple[list[str], list[str]]:
+	config_path = root / "config.toml"
+	try:
+		with config_path.open("rb") as stream:
+			config = tomllib.load(stream)
+	except (FileNotFoundError, tomllib.TOMLDecodeError) as exc:
+		raise WorkspaceError(f"invalid workspace config: {config_path}: {exc}") from exc
+
+	host_ports: list[str] = []
+	namespace_ports: list[str] = []
+	for index, item in enumerate(config.get("net", []) or [], 1):
+		if not isinstance(item, dict) or item.get("protocol", "tcp") != "tcp":
+			raise WorkspaceError(f"invalid TCP network rule #{index}")
+		try:
+			allow = item["allow"]
+			host_port = int(item["host_port"])
+			sandbox_port = int(item["sandbox_port"])
+		except (KeyError, TypeError, ValueError) as exc:
+			raise WorkspaceError(f"invalid network rule #{index}") from exc
+		if not 1 <= host_port <= 65535 or not 1 <= sandbox_port <= 65535:
+			raise WorkspaceError(f"invalid network port in rule #{index}")
+		if allow == "host_connect_sandbox":
+			host_ports.append(f"{host_port}:{sandbox_port}")
+		elif allow == "sandbox_connect_host":
+			namespace_ports.append(f"{sandbox_port}:{host_port}")
+		else:
+			raise WorkspaceError(f"invalid network direction in rule #{index}")
+	return host_ports, namespace_ports
+
+
+def ensure_workspace(workspaces: Path, name: str) -> Path | None:
+	if name == MAIN:
+		return None
+	path = workspaces / name
+	path.mkdir(mode=0o700, parents=True, exist_ok=True)
+	(path / "upper").mkdir(mode=0o700, exist_ok=True)
+	(path / "work").mkdir(mode=0o700, exist_ok=True)
+	return path
+
+
+def runtime_dir(project: Path) -> Path:
+	base = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/agent_workspace-{os.getuid()}"))
+	path = Path(tempfile.mkdtemp(prefix=f"{slug(project)}-", dir=base if base.exists() else None))
+	path.chmod(0o700)
+	return path
+
+
+def runtime_script(path: Path, command: list[str], workspace: str, workspaces: Path, project: Path) -> Path:
+	script = path / "agent.sh"
+	quoted = " ".join(shlex.quote(item) for item in command)
+	if workspace == MAIN:
+		setup = f"cd {shlex.quote(str(project))}"
+	else:
+		target = f"/agent/workspaces/{workspace}"
+		setup = f"cd {shlex.quote(target)}"
+	script.write_text(f"#!/bin/sh\nset -eu\n{setup}\nexec {quoted}\n", encoding="utf-8")
+	script.chmod(0o700)
+	return script
+
+
+def inner_command(
+	project: Path,
+	workspaces_source: Path,
+	runtime_source: Path,
+	script_name: str,
+	mount_args: list[str],
+	agent_home_source: Path = Path("/agent/agent-home"),
+	launcher_source: Path = Path("/agent/bin/launcher"),
+	project_source: Path | None = None,
+	home_source: Path | None = None,
+) -> list[str]:
+	runtime_target = Path("/agent/runtime")
+	project_source = project_source or project
+	env = inherited_environment(project)
+	project_dirs: list[str] = []
+	if home_source is None:
+		project_parent = Path("/")
+		for part in project.parts[1:-1]:
+			project_parent /= part
+			project_dirs.extend(["--dir", str(project_parent)])
+	home_args = ["--bind", str(home_source), str(Path.home())] if home_source is not None else []
+	args = [
+		"bwrap", "--unshare-all", "--share-net", "--die-with-parent",
+		"--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin",
+		"--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64",
+		"--ro-bind", "/etc", "/etc",
+		"--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+		"--dir", "/agent", "--dir", "/agent/bin", "--dir", str(runtime_target),
+		*home_args,
+		*project_dirs,
+		"--bind", str(project_source), str(project),
+		"--bind", str(workspaces_source), "/agent/workspaces",
+		"--bind", str(agent_home_source), "/agent/agent-home",
+		"--ro-bind", str(launcher_source), str(launcher_target()),
+		"--bind", str(runtime_source), str(runtime_target),
+		*mount_args,
+		"--chdir", str(project),
+		"--clearenv",
+		*environment_args(env),
+		"--setenv", "AGENT_WORKSPACES", "/agent/workspaces",
+		"--setenv", "AGENT_PROJECT", str(project),
+		"--setenv", "AGENT_RUNTIME", str(runtime_target),
+		"--setenv", INNER, "1",
+	]
+	args.extend(["--", "/usr/bin/bash", str(runtime_target / script_name)])
+	return args
+
+
+def run_inner(project: Path, workspaces: Path, runtime: Path, script: Path) -> int:
+	return subprocess.run(
+		inner_command(
+			project,
+			workspaces,
+			runtime,
+			script.name,
+			configured_mount_args(registry(project), inner=True),
+		),
+		check=False,
+	).returncode
+
+
+def child_pid(status_fd: int) -> int:
+	with os.fdopen(os.dup(status_fd), "r", encoding="utf-8") as stream:
+		for line in stream:
+			value = json.loads(line).get("child-pid")
+			if value is not None:
+				return int(value)
+	raise WorkspaceError("bwrap did not report child pid")
+
+
+def run_pure(
+	project: Path,
+	workspaces: Path,
+	runtime: Path,
+	script: Path,
+	workspace: str,
+	shared: bool,
+	root: Path,
+) -> int:
+	mount_args = configured_mount_args(root)
+	env = inherited_environment(project)
+	command = [
+		"bwrap", "--unshare-all", "--die-with-parent", "--proc", "/proc", "--dev", "/dev",
+		"--tmpfs", "/tmp", "--dir", "/agent", "--dir", "/agent/bin", "--dir", "/agent/runtime",
+		"--bind", str(project), str(project),
+		"--bind", str(workspaces), "/agent/workspaces",
+		"--bind", str(agent_home()), "/agent/agent-home",
+		"--ro-bind", str(Path(__file__).resolve()), str(launcher_target()),
+		"--ro-bind", str(runtime), "/agent/runtime",
+		*mount_args, *overlay_args(project, workspaces, workspace),
+		"--clearenv", *environment_args(env),
+	]
+	status_read, status_write = os.pipe()
+	if not shared:
+		command.extend(["--json-status-fd", str(status_write)])
+	if shared:
+		command.append("--share-net")
+	command.extend([
+		"--setenv", INNER, "1",
+		"--",
+		"/bin/sh",
+		f"/agent/runtime/{script.name}",
+	])
+	if shared:
+		return subprocess.run(command, check=False).returncode
+
+	process = subprocess.Popen(command, pass_fds=(status_write,))
+	os.close(status_write)
+	pasta = None
+	try:
+		pid = child_pid(status_read)
+		host_ports, namespace_ports = network_forwards(root)
+		pasta_command = [
+			"pasta", "--foreground", "--config-net", "--ipv4-only", "--no-map-gw",
+			"--host-lo-to-ns-lo", "--udp-ports", "none", "--udp-ns", "none", "--quiet",
+			"--tcp-ports", ",".join(host_ports) if host_ports else "none",
+			"--tcp-ns", ",".join(namespace_ports) if namespace_ports else "none",
+			str(pid),
+		]
+		pasta = subprocess.Popen(pasta_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+		try:
+			pasta.wait(timeout=1)
+		except subprocess.TimeoutExpired:
+			pass
+		if pasta.poll() is not None:
+			raise WorkspaceError("pasta network setup failed")
+		return process.wait()
+	finally:
+		os.close(status_read)
+		if pasta is not None and pasta.poll() is None:
+			pasta.terminate()
+			pasta.wait()
+		if process.poll() is None:
+			process.terminate()
+			process.wait()
+
+
+def run_vm(
+	project: Path,
+	workspaces: Path,
+	runtime: Path,
+	script: Path,
+	workspace: str,
+	shared: bool,
+	root: Path,
+) -> int:
+	log_path = runtime / "vm.log"
+	log_path.touch(mode=0o600)
+	runtime.chmod(0o755)
+	vm_modes: list[tuple[Path, int]] = []
+	accessible = [Path.home(), project, *project.parents, agent_home(), root, workspaces, workspaces / workspace]
+	seen: set[Path] = set()
+	for path in accessible:
+		if path in seen or (path != Path.home() and Path.home() not in path.parents):
+			continue
+		seen.add(path)
+		if path.exists():
+			vm_modes.append((path, path.stat().st_mode & 0o777))
+			path.chmod(0o755)
+	for path in (agent_home() / "config.toml", root / "config.toml"):
+		if path.exists():
+			vm_modes.append((path, path.stat().st_mode & 0o777))
+			path.chmod(0o644)
+	for path in (workspaces / workspace / "upper", workspaces / workspace / "work"):
+		if path.exists():
+			vm_modes.append((path, path.stat().st_mode & 0o777))
+			path.chmod(0o777)
+	guest_agent_script = runtime / "vm-agent.sh"
+	shutil.copyfile(script, guest_agent_script)
+	guest_agent_script.write_text(
+		guest_agent_script.read_text(encoding="utf-8")
+			.replace("#!/bin/sh\n", "#!/usr/bin/bash\n", 1)
+			.replace(f"cd /agent/workspaces/{workspace}\n", f"cd {shlex.quote(str(project))}\n"),
+		encoding="utf-8",
+	)
+	guest_agent_script.chmod(0o755)
+	inner = inner_command(
+		project,
+		Path("/workspaces"),
+		Path("/runtime"),
+		guest_agent_script.name,
+		[],
+		Path("/agent-home"),
+		Path("/launcher"),
+		project_source=Path("/project"),
+		home_source=Path("/host-home"),
+	)
+	vm_script = runtime / "vm.sh"
+	vm_script.write_text(
+		"#!/bin/sh\nexec " + " ".join(shlex.quote(item) for item in inner) + "\n",
+		encoding="utf-8",
+	)
+	vm_script.chmod(0o755)
+	outer = [
+		"bwrap", "--unshare-all", "--die-with-parent",
+		"--proc", "/proc", "--dev", "/dev",
+		"--dev-bind", "/dev/kvm", "/dev/kvm",
+		"--tmpfs", "/tmp",
+		*configured_mount_args(root),
+		"--bind", str(workspaces), "/workspaces",
+		"--bind", str(agent_home()), "/agent-home",
+		"--bind", str(Path.home()), "/host-home",
+		"--bind", str(runtime), "/runtime",
+		"--ro-bind", str(Path(__file__).resolve()), "/launcher",
+		"--clearenv", "--setenv", "PATH", os.environ.get("PATH", "/usr/bin:/bin"),
+		"--setenv", "HOME", os.environ.get("HOME", str(Path.home())),
+	]
+	if workspace == MAIN:
+		outer.extend(["--bind", str(project), "/project"])
+	else:
+		state = workspaces / workspace
+		outer.extend([
+			"--overlay-src", str(project),
+			"--overlay", str(state / "upper"), str(state / "work"), "/project",
+		])
+	if shared:
+		outer.append("--share-net")
+	outer.extend(["--", "chroot_vm", "--log=/runtime/vm.log", "/", "/bin/sh", "/runtime/vm.sh"])
+	try:
+		return subprocess.run(outer, check=False).returncode
+	finally:
+		for path, mode in reversed(vm_modes):
+			try:
+				path.chmod(mode)
+			except FileNotFoundError:
+				pass
+
+
+def editor_command() -> list[str]:
+	configured = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+	if not configured:
+		raise WorkspaceError("editor is not configured; set VISUAL or EDITOR")
+	return shlex.split(configured)
+
+
+def configure(project: Path, var: str | None, value: str | None) -> int:
+	root, _ = ensure_registry(project)
+	config_path = root / "config.toml"
+	if var is None and value is None:
+		return subprocess.call([*editor_command(), str(config_path)])
+	if var is None or value is None:
+		raise WorkspaceError("configure requires both var and value")
+	try:
+		with config_path.open("rb") as stream:
+			config = tomllib.load(stream)
+		import tomli_w
+	except tomllib.TOMLDecodeError as exc:
+		raise WorkspaceError(f"invalid workspace config: {config_path}: {exc}") from exc
+	config[var] = value
+	config_path.write_text(tomli_w.dumps(config), encoding="utf-8")
+	return 0
+
+
+def shell_command() -> list[str]:
+	configured = os.environ.get("SHELL")
+	return shlex.split(configured) if configured else ["/bin/sh"]
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+	parser = argparse.ArgumentParser(prog=launcher_name())
+	parser.add_argument("--workdir", default=None, help="Project workdir. Defaults to $PWD.")
+	subparsers = parser.add_subparsers(dest="subcommand", required=True)
+
+	configure_parser = subparsers.add_parser("configure", help="Open or update project config.toml.")
+	configure_parser.add_argument("var", nargs="?")
+	configure_parser.add_argument("value", nargs="?")
+
+	def add_execution_parser(name: str, help_text: str, command_required: bool) -> None:
+		execution_parser = subparsers.add_parser(name, help=help_text)
+		execution_parser.add_argument("--workspace", default=MAIN)
+		execution_parser.add_argument("--vm", action="store_true")
+		execution_parser.add_argument("--shared-network", action="store_true")
+		if command_required:
+			execution_parser.add_argument("command", nargs=argparse.REMAINDER)
+
+	add_execution_parser("shell", "Start a shell in a workspace.", False)
+	add_execution_parser("exec", "Run a command in a workspace.", True)
+	args = parser.parse_args(argv)
+	if args.subcommand == "exec":
+		if not args.command or args.command[0] != "--" or len(args.command) == 1:
+			parser.error("exec requires -- COMMAND [ARGS...]")
+		args.command = args.command[1:]
+	return args
+
+
+def main(argv: list[str] | None = None) -> int:
+	args = parse_args(argv or sys.argv[1:])
+	project = project_path(args.workdir)
+	if args.subcommand == "configure":
+		return configure(project, args.var, args.value)
+	if os.environ.get(INNER) == "1":
+		args.shared_network = True
+	workspace = validate_workspace(args.workspace)
+	_, workspaces = ensure_registry(project)
+	ensure_workspace(workspaces, workspace)
+	runtime = runtime_dir(project)
+	try:
+		command = args.command if args.subcommand == "exec" else shell_command()
+		script = runtime_script(runtime, command, workspace, workspaces, project)
+		if args.vm:
+			return run_vm(project, workspaces, runtime, script, workspace, args.shared_network, registry(project))
+		return run_pure(project, workspaces, runtime, script, workspace, args.shared_network, registry(project))
+	finally:
+		shutil.rmtree(runtime, ignore_errors=True)
+
+
+if __name__ == "__main__":
+	try:
+		raise SystemExit(main())
+	except WorkspaceError as exc:
+		print(f"{launcher_name()}: error: {exc}", file=sys.stderr)
+		raise SystemExit(2)

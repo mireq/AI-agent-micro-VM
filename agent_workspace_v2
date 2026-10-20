@@ -1,0 +1,693 @@
+#!/usr/bin/env python3
+"""Workspace manager using bwrap, fuse-overlayfs, and chroot_vm."""
+
+import argparse
+import dataclasses
+import hashlib
+import json
+import os
+import pwd
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from pathlib import Path
+
+
+DEFAULT_AGENT_CONFIG = '''[[mount]]
+flag = "r"
+src = "/usr"
+dst = "/usr"
+
+[[mount]]
+flag = "r"
+src = "/bin"
+dst = "/bin"
+
+[[mount]]
+flag = "r"
+src = "/lib"
+dst = "/lib"
+
+[[mount]]
+flag = "r"
+src = "/lib64"
+dst = "/lib64"
+
+[[mount]]
+flag = "r"
+src = "/opt"
+dst = "/opt"
+
+[[mount]]
+flag = "r"
+src = "/etc/passwd"
+dst = "/etc/passwd"
+
+[[mount]]
+flag = "r"
+src = "/etc/group"
+dst = "/etc/group"
+
+[[mount]]
+flag = "r"
+src = "/etc/nsswitch.conf"
+dst = "/etc/nsswitch.conf"
+
+[[mount]]
+flag = "r"
+src = "/etc/hosts"
+dst = "/etc/hosts"
+
+[[mount]]
+flag = "r"
+src = "/etc/resolv.conf"
+dst = "/etc/resolv.conf"
+
+[[mount]]
+flag = "r"
+src = "/etc/ld.so.cache"
+dst = "/etc/ld.so.cache"
+
+[[mount]]
+flag = "r"
+src = "/etc/ld.so.conf"
+dst = "/etc/ld.so.conf"
+
+[[mount]]
+flag = "r"
+src = "/etc/ld.so.conf.d"
+dst = "/etc/ld.so.conf.d"
+
+[[mount]]
+flag = "r"
+src = "/etc/localtime"
+dst = "/etc/localtime"
+
+[[mount]]
+flag = "r"
+src = "/etc/ssl"
+dst = "/etc/ssl"
+
+[[mount]]
+flag = "r"
+src = "/etc/pki"
+dst = "/etc/pki"
+'''
+DEFAULT_WORKDIR_CONFIG = ''
+SCRIPTS = ('workspace_post_create', 'workspace_pre_enter', 'workspace_pre_remove')
+SEPARATOR = '__'
+NO_BRANCH = '__none__'
+
+
+class CommandError(RuntimeError):
+	def __init__(self, message: str, code: int = 1) -> None:
+		super().__init__(message)
+		self.code = code
+
+
+@dataclasses.dataclass(frozen=True)
+class Mount:
+	flag: str
+	src: Path
+	dst: Path
+
+
+@dataclasses.dataclass(frozen=True)
+class Forward:
+	allow: str
+	host_port: int
+	sandbox_port: int
+
+
+@dataclasses.dataclass(frozen=True)
+class Context:
+	args: argparse.Namespace
+	workdir: Path
+	state: Path
+	config: Path
+	agent_config: Path
+	branch: str | None
+
+	@property
+	def workspace(self) -> Path:
+		return self.state / 'workspaces' / (self.branch or NO_BRANCH)
+
+	@property
+	def workspace_workdir(self) -> Path:
+		return root_target(self.workspace, self.workdir)
+
+	@property
+	def scripts(self) -> Path:
+		return self.state / 'scripts'
+
+
+def error(message: str, code: int = 2) -> None:
+	raise CommandError(message, code)
+
+
+def read_toml(path: Path) -> dict:
+	try:
+		with path.open('rb') as file:
+			return tomllib.load(file)
+	except tomllib.TOMLDecodeError as exc:
+		error(f'failed to parse {path}: {exc}')
+
+
+def agent_home() -> Path:
+	return Path(os.environ.get('AGENT_HOME', '~/.agent')).expanduser()
+
+
+def workdir_hash(path: Path) -> str:
+	return hashlib.sha256(str(path).encode()).hexdigest()
+
+
+def make_context(args: argparse.Namespace) -> Context:
+	workdir = Path(getattr(args, 'dir', None) or args.workdir).expanduser().resolve()
+	home = agent_home()
+	home.mkdir(parents=True, exist_ok=True)
+	agent_config = home / 'config.toml'
+	if not agent_config.exists():
+		agent_config.write_text(DEFAULT_AGENT_CONFIG, encoding='utf-8')
+	state = home / 'workdirs' / workdir_hash(workdir)
+	state.mkdir(parents=True, exist_ok=True)
+	config = state / 'config.toml'
+	if not config.exists():
+		config.write_text(DEFAULT_WORKDIR_CONFIG, encoding='utf-8')
+	(state / '.path').write_text(f'{workdir}\n', encoding='utf-8')
+	initialize_scripts(state)
+	return Context(args, workdir, state, config, agent_config, select_branch(args, config))
+
+
+def initialize_scripts(state: Path) -> None:
+	state.joinpath('scripts').mkdir(parents=True, exist_ok=True)
+	for name in SCRIPTS:
+		path = state / 'scripts' / name
+		if not path.exists():
+			path.write_text('#!/usr/bin/env bash\n', encoding='utf-8')
+		path.chmod(0o755)
+
+
+def select_branch(args: argparse.Namespace, config: Path) -> str | None:
+	if getattr(args, 'branch', None):
+		return args.branch
+	if os.environ.get('AGENT_BRANCH') not in (None, NO_BRANCH):
+		return os.environ['AGENT_BRANCH']
+	branch = read_toml(config).get('branch')
+	if branch is not None and (not isinstance(branch, str) or not branch):
+		error("config field 'branch' must be a non-empty string")
+	return branch
+
+
+def hook_env(context: Context) -> dict[str, str]:
+	env = os.environ.copy()
+	env.update(AGENT_BRANCH=context.branch or NO_BRANCH, AGENT_WORKSPACE_DIR=str(context.workspace))
+	return env
+
+
+def run_hook(context: Context, name: str) -> None:
+	command = [str(context.scripts / name)]
+	if name == 'workspace_pre_enter':
+		command += [str(context.workspace), context.branch or NO_BRANCH]
+	result = subprocess.run(command, check=False, env=hook_env(context))
+	if result.returncode:
+		error(f'{name} failed with exit code {result.returncode}', result.returncode)
+
+
+def ensure_workspace(context: Context) -> None:
+	new = not context.workspace.exists()
+	context.workspace.mkdir(parents=True, exist_ok=True)
+	if new:
+		run_hook(context, 'workspace_post_create')
+
+
+def parse_mounts(config: dict, source: Path) -> list[Mount]:
+	entries = config.get('mount', [])
+	if entries is None:
+		return []
+	if not isinstance(entries, list):
+		error(f'{source}: mount must be an array')
+	mounts = []
+	for index, entry in enumerate(entries, 1):
+		if not isinstance(entry, dict):
+			error(f'{source}: mount #{index} must be a table')
+		flag, src, dst = entry.get('flag'), entry.get('src'), entry.get('dst')
+		if flag not in ('r', 'w', 'o'):
+			error(f'{source}: mount #{index} flag must be r, w, or o')
+		if not isinstance(src, str) or not src.startswith('/'):
+			error(f'{source}: mount #{index} src must be an absolute path')
+		if not isinstance(dst, str) or not dst.startswith('/'):
+			error(f'{source}: mount #{index} dst must be an absolute path')
+		mounts.append(Mount(flag, Path(src).expanduser(), Path(os.path.normpath(dst))))
+	return mounts
+
+
+def configured_mounts(context: Context) -> list[Mount]:
+	mounts = parse_mounts(read_toml(context.agent_config), context.agent_config)
+	mounts += parse_mounts(read_toml(context.config), context.config)
+	if context.branch:
+		mounts.append(Mount('o', context.workdir, context.workdir))
+	else:
+		mounts = [mount for mount in mounts if mount.flag != 'o']
+		mounts.append(Mount('w', context.workdir, context.workdir))
+	seen = set()
+	result = []
+	for mount in reversed(mounts):
+		if mount.dst in seen:
+			continue
+		seen.add(mount.dst)
+		result.append(mount)
+	return list(reversed(result))
+
+
+def root_target(workspace: Path, destination: Path) -> Path:
+	return workspace / 'root' / destination.relative_to('/')
+
+
+def overlay_state(workspace: Path, destination: Path) -> Path:
+	relative = destination.relative_to('/')
+	return workspace / 'overlay' / (relative if str(relative) != '.' else '__root__')
+
+
+def mounted_paths(path: Path) -> list[Path]:
+	try:
+		lines = Path('/proc/self/mountinfo').read_text(encoding='utf-8').splitlines()
+	except OSError:
+		return []
+	paths = []
+	for line in lines:
+		fields = line.split(' ')
+		if len(fields) > 4:
+			mountpoint = Path(fields[4].replace('\\040', ' ').replace('\\011', '\t'))
+			if mountpoint == path or path in mountpoint.parents:
+				paths.append(mountpoint)
+	return sorted(paths, key=lambda item: len(item.parts), reverse=True)
+
+
+def mounted(path: Path) -> bool:
+	return path in mounted_paths(path)
+
+
+def run_mount(command: list[str], description: str) -> None:
+	result = subprocess.run(command, check=False, stderr=subprocess.PIPE, text=True)
+	if result.returncode:
+		error(result.stderr.strip() or f'{description} failed', result.returncode)
+
+
+def mount_overlay(workspace: Path, mount: Mount) -> None:
+	source = mount.src.resolve(strict=False)
+	if not source.exists():
+		return
+	if not source.is_dir():
+		error(f'overlay source must be a directory: {source}')
+	target = root_target(workspace, mount.dst)
+	target.mkdir(parents=True, exist_ok=True)
+	if mounted(target):
+		return
+	state = overlay_state(workspace, mount.dst)
+	upper, work = state / 'upper', state / 'work'
+	upper.mkdir(parents=True, exist_ok=True)
+	work.mkdir(parents=True, exist_ok=True)
+	run_mount(['fuse-overlayfs', '-o', f'lowerdir={source},upperdir={upper},workdir={work}', str(target)], f'overlay mount {source}')
+
+
+def prepare_workspace(context: Context) -> None:
+	context.workspace.joinpath('root').mkdir(parents=True, exist_ok=True)
+	for mount in configured_mounts(context):
+		if mount.flag == 'o':
+			mount_overlay(context.workspace, mount)
+
+
+def bwrap_mount_args(context: Context, scratch: Path) -> list[str]:
+	entries = []
+	directories = set()
+	for mount in configured_mounts(context):
+		if mount.flag == 'o':
+			source = root_target(context.workspace, mount.dst)
+			if source.exists():
+				entries.append(('--bind', source, mount.dst))
+		elif mount.src.exists():
+			end = mount.dst if mount.src.is_dir() else mount.dst.parent
+			for index in range(1, len(end.parts)):
+				directories.add(Path('/').joinpath(*end.parts[1:index + 1]))
+			entries.append(('--ro-bind-try' if mount.flag == 'r' else '--bind-try', mount.src, mount.dst))
+	result = []
+	for directory in sorted(directories, key=lambda item: len(item.parts)):
+		result += ['--dir', str(directory)]
+	for flag, source, destination in entries:
+		if source.is_file():
+			if flag == '--ro-bind-try':
+				copy = scratch / str(len(result))
+				shutil.copy2(source, copy)
+				result += ['--ro-bind', str(copy), str(destination)]
+				continue
+		result += [flag, str(source), str(destination)]
+	return result
+
+
+def port(value: object, source: Path, index: int, name: str) -> int:
+	if not isinstance(value, int) or not 1 <= value <= 65535:
+		error(f'{source}: net #{index} {name} must be an integer between 1 and 65535')
+	return value
+
+
+def configured_forwards(context: Context) -> list[Forward]:
+	entries = read_toml(context.config).get('net', [])
+	if entries is None:
+		return []
+	if not isinstance(entries, list):
+		error(f'{context.config}: net must be an array')
+	forwards = []
+	for index, entry in enumerate(entries, 1):
+		if not isinstance(entry, dict):
+			error(f'{context.config}: net #{index} must be a table')
+		allow = entry.get('allow')
+		if allow not in ('host_connect_sandbox', 'sandbox_connect_host'):
+			error(f'{context.config}: net #{index} has invalid allow rule')
+		if entry.get('protocol', 'tcp') != 'tcp':
+			error(f'{context.config}: net #{index} protocol must be tcp')
+		forwards.append(Forward(allow, port(entry.get('host_port'), context.config, index, 'host_port'), port(entry.get('sandbox_port'), context.config, index, 'sandbox_port')))
+	return forwards
+
+
+def pasta_command(child_pid: int, forwards: list[Forward]) -> list[str]:
+	command = ['pasta', '--foreground', '--quiet', '--config-net', '--ipv4-only', '--no-map-gw', '--udp-ports', 'none', '--udp-ns', 'none', '--host-lo-to-ns-lo']
+	host_to_sandbox = [item for item in forwards if item.allow == 'host_connect_sandbox']
+	sandbox_to_host = [item for item in forwards if item.allow == 'sandbox_connect_host']
+	command += sum((['--tcp-ports', f'{item.host_port}:{item.sandbox_port}'] for item in host_to_sandbox), []) or ['--tcp-ports', 'none']
+	command += sum((['--tcp-ns', f'{item.sandbox_port}:{item.host_port}'] for item in sandbox_to_host), []) or ['--tcp-ns', 'none']
+	return [*command, str(child_pid)]
+
+
+def passt_command(forwards: list[Forward]) -> list[str]:
+	command = ['/usr/bin/passt', '--quiet', '--address', '10.0.2.100', '--netmask', '255.255.255.0', '--gateway', '10.0.2.2', '--ipv4-only', '--udp-ports', 'none']
+	host_to_sandbox = [item for item in forwards if item.allow == 'host_connect_sandbox']
+	sandbox_to_host = [item for item in forwards if item.allow == 'sandbox_connect_host']
+	if sandbox_to_host:
+		command += ['--map-host-loopback', '10.0.2.2']
+	command += sum((['--tcp-ports', f'127.0.0.1/{item.host_port}:{item.sandbox_port}'] for item in host_to_sandbox), []) or ['--tcp-ports', 'none']
+	return command
+
+
+def environment(context: Context) -> dict[str, str]:
+	env = {key: os.environ[key] for key in ('HOME', 'USER', 'LOGNAME', 'SHELL', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM') if key in os.environ}
+	for source in (context.agent_config, context.config):
+		values = read_toml(source).get('env', {})
+		if values is None:
+			continue
+		if not isinstance(values, dict):
+			error(f'{source}: env must be a table')
+		for key, value in values.items():
+			if not isinstance(value, (bool, str, int, float)):
+				error(f'{source}: env.{key} must be a string, number, or boolean')
+			env[str(key)] = ('1' if value else '0') if isinstance(value, bool) else str(value)
+	env['PWD'] = str(context.workdir)
+	if context.branch:
+		env['AGENT_BRANCH'] = context.branch
+	else:
+		env.pop('AGENT_BRANCH', None)
+	return env
+
+
+def shell_quote(command: list[str]) -> str:
+	return ' '.join(shlex.quote(value) for value in command)
+
+
+def setpriv() -> list[str]:
+	uid, gid = os.getuid(), os.getgid()
+	groups = [str(group) for group in os.getgroups() if group != gid]
+	return ['/usr/bin/setpriv', '--reuid', str(uid), '--regid', str(gid), '--groups', ','.join(groups)] if groups else ['/usr/bin/setpriv', '--reuid', str(uid), '--regid', str(gid), '--clear-groups']
+
+
+def vm_command(context: Context, command: list[str], env: dict[str, str], setup_path: str | None = None) -> list[str]:
+	inside = ['env', '-i', *(f'{key}={value}' for key, value in env.items()), *command]
+	shell = f'cd {shlex.quote(str(context.workdir))} && exec {shell_quote(inside)}'
+	if setup_path:
+		return ['chroot_vm', '--net=PASST', '--log=/dev/null', '/', '/bin/sh', setup_path]
+	return ['chroot_vm', '--net=PASST', '--log=/dev/null', '/', *setpriv(), '/bin/sh', '-lc', shell]
+
+
+def write_vm_files(directory: Path, context: Context, command: list[str], env: dict[str, str], forwards: list[Forward]) -> None:
+	(directory / 'passt').write_text(f'#!/bin/sh\nexec {shell_quote(passt_command(forwards))} "$@"\n', encoding='utf-8')
+	(directory / 'passt').chmod(0o755)
+	guest = ['#!/bin/sh', 'ip link set eth0 up', 'ip addr add 10.0.2.100/24 dev eth0 2>/dev/null || true', 'ip route add default via 10.0.2.2 dev eth0 2>/dev/null || true']
+	for item in forwards:
+		if item.allow == 'sandbox_connect_host':
+			guest.append(f'socat TCP-LISTEN:{item.sandbox_port},bind=127.0.0.1,reuseaddr,fork TCP:10.0.2.2:{item.host_port} &')
+	inside = ['env', '-i', *(f'{key}={value}' for key, value in env.items()), *command]
+	guest.append(f'exec {shell_quote([*setpriv(), "/bin/sh", "-lc", f"cd {shlex.quote(str(context.workdir))} && exec {shell_quote(inside)}"])}')
+	(directory / 'setup.sh').write_text('\n'.join(guest) + '\n', encoding='utf-8')
+	(directory / 'setup.sh').chmod(0o755)
+
+
+def bwrap_command(context: Context, command: list[str], scratch: Path, vm_files: Path | None = None, extra: list[str] | None = None) -> list[str]:
+	if not command:
+		error('command must not be empty')
+	vm = getattr(context.args, 'vm', False)
+	args = ['bwrap', '--unshare-all', '--die-with-parent', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp']
+	if getattr(context.args, 'shared_network', False) or vm:
+		args.append('--share-net')
+	if vm:
+		if not Path('/dev/kvm').exists():
+			error('VM mode requires /dev/kvm')
+		args += ['--dev-bind', '/dev/kvm', '/dev/kvm']
+		if vm_files is None:
+			error('VM network setup is missing')
+		args += ['--ro-bind', str(vm_files), '/agent-workspace-v2']
+	args += bwrap_mount_args(context, scratch)
+	env = environment(context)
+	args += ['--clearenv', '--chdir', str(context.workdir)]
+	for key, value in env.items():
+		args += ['--setenv', key, value]
+	setup_path = '/agent-workspace-v2/setup.sh' if vm else None
+	if vm and vm_files is not None:
+		env['PATH'] = f'/agent-workspace-v2:{env.get("PATH", "/usr/bin:/bin")}'
+		args = args[:args.index('--clearenv')]
+		args += ['--clearenv', '--chdir', str(context.workdir)]
+		for key, value in env.items():
+			args += ['--setenv', key, value]
+	args += [*(extra or []), '--', *(vm_command(context, command, env, setup_path) if vm else command)]
+	return args
+
+
+def child_pid(status_fd: int) -> int:
+	with os.fdopen(status_fd, encoding='utf-8') as stream:
+		for line in stream:
+			pid = json.loads(line).get('child-pid')
+			if pid is not None:
+				return pid
+	error('bwrap did not report child pid')
+
+
+def run_isolated(context: Context, command: list[str], forwards: list[Forward]) -> int:
+	status_read, status_write = os.pipe()
+	block_read, block_write = os.pipe()
+	scratch = Path(tempfile.mkdtemp(prefix='agent-workspace-v2-'))
+	bwrap = subprocess.Popen(bwrap_command(context, command, scratch, extra=['--json-status-fd', str(status_write), '--block-fd', str(block_read)]), pass_fds=(status_write, block_read), close_fds=True)
+	os.close(status_write)
+	os.close(block_read)
+	pasta = None
+	try:
+		pasta = subprocess.Popen(pasta_command(child_pid(status_read), forwards), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, close_fds=True)
+		time.sleep(0.25)
+		if pasta.poll() is not None:
+			message = pasta.stderr.read().decode(errors='replace').strip() if pasta.stderr else 'pasta network setup failed'
+			error(message or 'pasta network setup failed', pasta.returncode or 1)
+		os.close(block_write)
+		block_write = -1
+		return bwrap.wait()
+	finally:
+		if block_write >= 0:
+			os.close(block_write)
+		if pasta is not None and pasta.poll() is None:
+			pasta.terminate()
+			pasta.wait()
+		shutil.rmtree(scratch, ignore_errors=True)
+
+
+def enter(context: Context, command: list[str]) -> int:
+	ensure_workspace(context)
+	prepare_workspace(context)
+	run_hook(context, 'workspace_pre_enter')
+	forwards = configured_forwards(context)
+	if getattr(context.args, 'vm', False):
+		with tempfile.TemporaryDirectory(prefix='agent-workspace-v2-') as directory:
+			files = Path(directory)
+			write_vm_files(files, context, command, environment(context), forwards)
+			return subprocess.call(bwrap_command(context, command, files, files))
+	if getattr(context.args, 'shared_network', False):
+		with tempfile.TemporaryDirectory(prefix='agent-workspace-v2-') as directory:
+			return subprocess.call(bwrap_command(context, command, Path(directory)))
+	return run_isolated(context, command, forwards)
+
+
+def shell_command() -> list[str]:
+	return shlex.split(os.environ['SHELL']) if os.environ.get('SHELL') else [pwd.getpwuid(os.getuid()).pw_shell or '/bin/sh']
+
+
+def write_toml(path: Path, config: dict) -> None:
+	try:
+		import tomli_w
+	except ImportError:
+		error('configure requires tomli-w')
+	path.write_text(tomli_w.dumps(config), encoding='utf-8')
+
+
+def configure(context: Context) -> int:
+	if context.args.var is None and context.args.value is None:
+		editor = os.environ.get('VISUAL') or os.environ.get('EDITOR')
+		if not editor:
+			error('editor is not configured; set VISUAL or EDITOR')
+		return subprocess.call([*shlex.split(editor), str(context.config)])
+	if context.args.var is None or context.args.value is None:
+		error('configure requires both var and value')
+	config = read_toml(context.config)
+	config[context.args.var] = context.args.value
+	write_toml(context.config, config)
+	return 0
+
+
+def command_cd(context: Context) -> int:
+	ensure_workspace(context)
+	prepare_workspace(context)
+	run_hook(context, 'workspace_pre_enter')
+	env = os.environ.copy()
+	env['PWD'] = str(context.workspace_workdir if context.branch else context.workdir)
+	if context.branch:
+		env['AGENT_BRANCH'] = context.branch
+	os.chdir(env['PWD'])
+	os.execvpe(shell_command()[0], shell_command(), env)
+	raise AssertionError('execvpe returned')
+
+
+def remove_workspace(context: Context) -> int:
+	if not context.workspace.exists():
+		error(f'workspace does not exist: {context.workspace}')
+	if not context.args.yes:
+		sys.stderr.write(f'Remove workspace "{context.workspace_name}"? [y/N] ')
+		if sys.stdin.readline().strip().lower() not in ('y', 'yes'):
+			error('remove aborted')
+	run_hook(context, 'workspace_pre_remove')
+	for path in mounted_paths(context.workspace):
+		run_mount(['fusermount3', '-u', '-z', str(path)], f'unmount {path}')
+	shutil.rmtree(context.workspace)
+	return 0
+
+
+def mount_workspace(context: Context) -> int:
+	if not context.branch:
+		error('branch is not configured')
+	ensure_workspace(context)
+	prepare_workspace(context)
+	if context.workdir in mounted_paths(context.workdir):
+		return 0
+	run_mount(['bindfs', '-o', f'fsname={context.workspace_workdir}', str(context.workspace_workdir), str(context.workdir)], f'bindfs mount {context.workspace_workdir}')
+	return 0
+
+
+def unmount_workspace(context: Context) -> int:
+	if context.workdir in mounted_paths(context.workdir):
+		run_mount(['fusermount3', '-u', '-z', str(context.workdir)], f'unmount {context.workdir}')
+	return 0
+
+
+def list_workspaces(context: Context) -> int:
+	root = agent_home() / 'workdirs'
+	print(root)
+	for state in sorted(root.glob('*')):
+		if not state.is_dir():
+			continue
+		origin_file = state / '.path'
+		origin = origin_file.read_text(encoding='utf-8').strip() if origin_file.exists() else str(state)
+		for workspace in sorted((state / 'workspaces').glob('*')):
+			if workspace.is_dir():
+				marker = '(*)' if state == context.state and workspace.name == (context.branch or NO_BRANCH) else '   '
+				print(f'{marker} {origin} {workspace.name}')
+	return 0
+
+
+def parser() -> argparse.ArgumentParser:
+	parser = argparse.ArgumentParser(prog='agent_workspace_v2')
+	parser.add_argument('--workdir', default=os.environ.get('PWD', os.getcwd()))
+	sub = parser.add_subparsers(dest='command', required=True)
+
+	def branch_dir(command: argparse.ArgumentParser) -> None:
+		command.add_argument('-b', '--branch')
+		command.add_argument('-d', '--dir')
+
+	configure_parser = sub.add_parser('configure')
+	configure_parser.add_argument('var', nargs='?')
+	configure_parser.add_argument('value', nargs='?')
+	branch_parser = sub.add_parser('branch')
+	branch_parser.add_argument('name')
+	for name in ('cd', 'shell'):
+		command = sub.add_parser(name)
+		branch_dir(command)
+		if name == 'shell':
+			command.add_argument('--shared-network', action='store_true')
+			command.add_argument('--vm', action='store_true')
+	exec_parser = sub.add_parser('exec')
+	exec_parser.add_argument('--shared-network', action='store_true')
+	exec_parser.add_argument('--vm', action='store_true')
+	exec_parser.add_argument('exec_command', nargs=argparse.REMAINDER)
+	subagent = sub.add_parser('subagent')
+	subagent.add_argument('name')
+	subagent.add_argument('exec_command', nargs=argparse.REMAINDER)
+	activate = sub.add_parser('activate')
+	branch_dir(activate)
+	deactivate = sub.add_parser('deactivate')
+	branch_dir(deactivate)
+	umount = sub.add_parser('umount')
+	branch_dir(umount)
+	rm = sub.add_parser('rm')
+	branch_dir(rm)
+	rm.add_argument('--yes', action='store_true')
+	sub.add_parser('ls').add_argument('-a', '--all', action='store_true')
+	return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+	args = parser().parse_args(argv)
+	context = make_context(args)
+	if args.command == 'configure':
+		return configure(context)
+	if args.command == 'branch':
+		config = read_toml(context.config)
+		config['branch'] = args.name
+		write_toml(context.config, config)
+		return 0
+	if args.command == 'cd':
+		return command_cd(context)
+	if args.command == 'shell':
+		return enter(context, shell_command())
+	if args.command == 'exec':
+		if not args.exec_command or args.exec_command[0] != '--' or len(args.exec_command) == 1:
+			error('exec requires -- followed by command')
+		return enter(context, args.exec_command[1:])
+	if args.command == 'subagent':
+		if not args.exec_command:
+			error('subagent command is required')
+		branch = f'{context.branch}{SEPARATOR}{args.name}' if context.branch else args.name
+		return enter(dataclasses.replace(context, branch=branch), args.exec_command)
+	if args.command == 'activate':
+		return mount_workspace(context)
+	if args.command == 'deactivate':
+		return unmount_workspace(context)
+	if args.command == 'umount':
+		for path in mounted_paths(context.workspace):
+			run_mount(['fusermount3', '-u', '-z', str(path)], f'unmount {path}')
+		return 0
+	if args.command == 'rm':
+		return remove_workspace(context)
+	return list_workspaces(context)
+
+
+if __name__ == '__main__':
+	try:
+		sys.exit(main())
+	except CommandError as exc:
+		sys.stderr.write(f'agent_workspace_v2: error: {exc}\n')
+		sys.exit(exc.code)
