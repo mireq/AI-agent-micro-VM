@@ -206,8 +206,8 @@ def build_bwrap_args(
 	return args
 
 
-def pasta_port_spec(forward: NetForward) -> str:
-	if forward.allow == 'host_connect_sandbox':
+def pasta_port_spec(forward: NetForward, allow: str) -> str:
+	if allow == 'host_connect_sandbox':
 		return f'{forward.host_port}:{forward.sandbox_port}'
 	return f'{forward.sandbox_port}:{forward.host_port}'
 
@@ -218,13 +218,13 @@ def build_pasta_args(bwrap_command: list[str], context: CommandContext, host_loo
 
 	if configuration.host_connect_sandbox_ports:
 		for forward in configuration.host_connect_sandbox_ports:
-			forwards.extend(['--tcp-ports', pasta_port_spec(forward)])
+			forwards.extend(['--tcp-ports', pasta_port_spec(forward, 'host_connect_sandbox')])
 	else:
 		forwards.extend(['--tcp-ports', 'none'])
 
 	if configuration.sandbox_connect_host_ports:
 		for forward in configuration.sandbox_connect_host_ports:
-			forwards.extend(['--tcp-ns', pasta_port_spec(forward)])
+			forwards.extend(['--tcp-ns', pasta_port_spec(forward, 'sandbox_connect_host')])
 	else:
 		forwards.extend(['--tcp-ns', 'none'])
 
