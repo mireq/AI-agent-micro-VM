@@ -6,6 +6,7 @@ import pwd
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -143,11 +144,11 @@ def check_worktree_name(name: str):
 
 
 def build_bwrap_args(
-	context: CommandContext,
+		context: CommandContext,
 	command: list[str],
 	extra_options: list[str] | None = None,
+	vm: bool = False,
 ):
-	vm = False
 	dev_args = []
 
 	tun_path = Path('/dev/net/tun')
@@ -185,17 +186,23 @@ def build_bwrap_args(
 	bwrap_env_args = []
 	for key, value in context.configuration.env.items():
 		bwrap_env_args.extend(['--setenv', key, value])
+	if vm and not context.args.shared_network:
+		bwrap_env_args.extend([
+			'--setenv', 'PATH',
+			f'/runtime:{os.environ.get("PATH", "/usr/bin:/bin")}',
+		])
 
 	args = [
 		'bwrap',
 		'--unshare-all',
-		'--share-net',
+		*(['--share-net'] if vm or context.args.shared_network else []),
 		'--die-with-parent',
 		'--proc', '/proc',
 		'--dev', '/dev',
 		*dev_args,
 		'--tmpfs', '/tmp',
 		*bwrap_mount_args,
+		'--bind', str(context.runtime), '/runtime',
 		'--clearenv',
 		'--chdir',
 		str(context.project_path),
@@ -271,22 +278,34 @@ def get_shell_command() -> list[str]:
 	return ['/bin/sh']
 
 
-def vm_shell_command(context: CommandContext, command: list[str], status_path: Path | None) -> str:
-	vm_command = ['env', '-i', *[f'{key}={value}' for key, value in context.configuration.env.items()], *command]
-	run_command = shlex.join(vm_command)
+def passt_command(context: CommandContext) -> list[str]:
+	command = [
+		'/usr/bin/passt', '--quiet', '--address', VM_PASST_ADDRESS,
+		'--netmask', VM_PASST_NETMASK, '--gateway', VM_PASST_GATEWAY,
+		'--ipv4-only', '--udp-ports', 'none',
+	]
+	if context.configuration.sandbox_connect_host_ports:
+		command.extend(['--map-host-loopback', VM_PASST_GATEWAY])
+	for forward in context.configuration.host_connect_sandbox_ports:
+		command.extend(['--tcp-ports', f'127.0.0.1/{forward.host_port}:{forward.sandbox_port}'])
+	if not context.configuration.host_connect_sandbox_ports:
+		command.extend(['--tcp-ports', 'none'])
+	return command
 
-	return (
-		f'cd {shlex.quote(str(context.project_path))} && {run_command}; '
-		'status=$?; '
-		f'printf %s "$status" > {shlex.quote(str(status_path))}; '
-		'exit "$status"'
-	)
 
-
-def write_vm_run_script(context: CommandContext, command: list[str])-> Path:
+def write_vm_run_script(context: CommandContext, command: list[str]) -> Path:
+	control = context.runtime / 'control.sock'
+	control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+	try:
+		control_socket.bind(str(control))
+	finally:
+		control_socket.close()
+	passt = context.runtime / 'passt'
+	passt.write_text('#!/bin/sh\nexec ' + shlex.join(passt_command(context)) + ' "$@"\n', encoding='utf-8')
+	passt.chmod(0o700)
 	network_commands = [
 		'#!/bin/sh',
-		'ip link set eth0 up',
+		'ip link set eth0 up 2>/dev/null || true',
 		f'ip addr add {VM_PASST_ADDRESS}/24 dev eth0 2>/dev/null || true',
 		f'ip route add default via {VM_PASST_GATEWAY} dev eth0 2>/dev/null || true',
 	]
@@ -295,40 +314,34 @@ def write_vm_run_script(context: CommandContext, command: list[str])-> Path:
 			f'socat TCP-LISTEN:{forward.sandbox_port},bind=127.0.0.1,reuseaddr,fork '
 			f'TCP:{VM_PASST_GATEWAY}:{forward.host_port} & true'
 		)
-	status_file = tempfile.NamedTemporaryFile(
-		mode='w',
-		encoding='utf-8',
-		suffix='.status',
-		dir=context.runtime,
-		delete=True,
+	vm_command = ['env', '-i', *[f'{key}={value}' for key, value in context.configuration.env.items()], *command]
+	network_commands.append(
+		f'cd {shlex.quote(str(context.project_path))}'
+		f' && exec {shlex.join(vm_command)}'
 	)
-	network_commands.append('exec ' + shlex.join([*setpriv_command(), '/bin/sh', '-lc', vm_shell_command(context, command, str(status_file))]))
-	script_file = tempfile.NamedTemporaryFile(
-		mode='w',
-		encoding='utf-8',
-		suffix='.sh',
-		dir=context.runtime,
-		delete=True,
-	)
-	script_file.write('\n'.join(network_commands) + '\n')
-	script_file.flush()
-	return Path(script_file.name), cast(IO[str], script_file)
+	script_file = context.runtime / 'vm.sh'
+	script_file.write_text('\n'.join(network_commands) + '\n', encoding='utf-8')
+	script_file.chmod(0o700)
+	return script_file
 
 
 def run_command(context: CommandContext, command: list[str]):
-	extra_options = []
+	if context.args.vm:
+		if not Path('/dev/kvm').exists():
+			raise CommandError('VM mode requires /dev/kvm')
+		write_vm_run_script(context, command)
+		(context.runtime / 'vm.log').touch(mode=0o600)
+		vm_command = [
+			'chroot_vm',
+			*([] if context.args.shared_network else ['--net=PASST']),
+			'--log=/runtime/vm.log', '/', '/bin/sh', '/runtime/vm.sh',
+		]
+		wrapped_args = build_bwrap_args(context, vm_command, vm=True)
+		return subprocess.call(wrapped_args)
 
-	vm_run_script = write_vm_run_script(context, command)
-
-	wrapped_args = build_bwrap_args(
-		context=context,
-		command=command,
-		extra_options=extra_options,
-	)
-
+	wrapped_args = build_bwrap_args(context, command)
 	if not context.args.shared_network:
 		wrapped_args = build_pasta_args(wrapped_args, context=context)
-
 	return subprocess.call(wrapped_args)
 
 
