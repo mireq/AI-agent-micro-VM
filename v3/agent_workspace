@@ -173,22 +173,43 @@ def build_bwrap_args(
 	return args
 
 
-def build_pasta_args(bwrap_command: list[str]):
+def pasta_port_spec(forward: NetForward) -> str:
+	if forward.allow == 'host_connect_sandbox':
+		return f'{forward.host_port}:{forward.sandbox_port}'
+	return f'{forward.sandbox_port}:{forward.host_port}'
+
+
+def build_pasta_args(bwrap_command: list[str], context: CommandContext, host_loopback_to_namespace_loopback: bool = True):
+	forwards = []
+	configuration = context.configuration
+
+	if configuration.host_connect_sandbox_ports:
+		for forward in configuration.host_connect_sandbox_ports:
+			forwards.extend(['--tcp-ports', pasta_port_spec(forward)])
+	else:
+		forwards.extend(['--tcp-ports', 'none'])
+
+	if configuration.sandbox_connect_host_ports:
+		for forward in configuration.sandbox_connect_host_ports:
+			forwards.extend(['--tcp-ns', pasta_port_spec(forward)])
+	else:
+		forwards.extend(['--tcp-ns', 'none'])
+
 	command = [
 		'pasta',
 		'--foreground',
 		'--config-net',
 		'--ipv4-only',
 		'--no-map-gw',
-		'--udp-ports',
-		'none',
-		'--udp-ns',
-		'none',
-		'--host-lo-to-ns-lo',
+		'--udp-ports', 'none',
+		'--udp-ns', 'none',
+		*(['--host-lo-to-ns-lo'] if host_loopback_to_namespace_loopback else []),
+		*forwards,
 		'--quiet',
 		'--',
 		*bwrap_command,
 	]
+	print(shlex.join(command))
 	return command
 
 
@@ -265,7 +286,7 @@ def command_exec(context: CommandContext):
 	)
 
 	if not context.args.shared_network:
-		wrapped_args = build_pasta_args(wrapped_args)
+		wrapped_args = build_pasta_args(wrapped_args, context=context)
 
 	return subprocess.call(wrapped_args)
 
