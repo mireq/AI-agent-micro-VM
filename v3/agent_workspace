@@ -3,13 +3,15 @@ import argparse
 import hashlib
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
-import tomllib
 import tempfile
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-import shutil
+from typing import cast, IO
 
 
 NESTED_ENV = 'AGENT_WORKSPACE_NESTED'
@@ -97,6 +99,17 @@ dst = "/etc/pki"
 DEFAULT_WORKSPACE_CONFIG = ''
 SCRIPTS = ('workspace_post_create', 'workspace_pre_enter', 'workspace_pre_remove')
 
+VM_PASST_ADDRESS = '10.0.2.100'
+VM_PASST_GATEWAY = '10.0.2.2'
+VM_PASST_NETMASK = '255.255.255.0'
+
+
+@dataclass(frozen=True)
+class NetForward:
+	protocol: str
+	host_port: int
+	sandbox_port: int
+
 
 class CommandError(RuntimeError):
 	def __init__(self, message: str, return_code: int = 1) -> None:
@@ -107,8 +120,8 @@ class CommandError(RuntimeError):
 @dataclass
 class Configuration:
 	mounts: list[tuple[str, Path, Path]]
-	host_connect_sandbox_ports: list[str]
-	sandbox_connect_host_ports: list[str]
+	host_connect_sandbox_ports: list[NetForward]
+	sandbox_connect_host_ports: list[NetForward]
 	env: dict[str, str]
 
 
@@ -131,10 +144,27 @@ def build_bwrap_args(
 	command: list[str],
 	extra_options: list[str] | None = None,
 ):
+	vm = False
+	dev_args = []
+
+	tun_path = Path('/dev/net/tun')
+	if tun_path.exists():
+		dev_args.extend(['--dev-bind', str(tun_path), str(tun_path)])
+
+	if vm:
+		kvm_path = Path('/dev/kvm')
+		if not kvm_path.exists():
+			raise CommandError("VM mode requires /dev/kvm", return_code=1)
+		dev_args.extend(['--dev-bind', str(kvm_path), str(kvm_path)])
+
 	args = [
 		'bwrap',
 		'--unshare-all',
 		'--die-with-parent',
+		'--proc', '/proc',
+		'--dev', '/dev',
+		*dev_args,
+		'--tmpfs', '/tmp',
 		'--ro-bind', '/', '/',
 		*(extra_options or []),
 		'--',
@@ -162,17 +192,76 @@ def build_pasta_args(bwrap_command: list[str]):
 	return command
 
 
+def setpriv_command() -> list[str]:
+	uid = os.getuid()
+	gid = os.getgid()
+	groups = list(dict.fromkeys(group for group in os.getgroups() if group != gid))
+	command = ['/usr/bin/setpriv', '--reuid', str(uid), '--regid', str(gid)]
+	if groups:
+		command.extend(['--groups', ','.join(str(group) for group in groups)])
+	else:
+		command.append('--clear-groups')
+
+	return command
+
+
+def vm_shell_command(context: CommandContext, command: list[str], status_path: Path | None) -> str:
+	vm_command = ['env', '-i', *[f'{key}={value}' for key, value in context.configuration.env.items()], *command]
+	run_command = shlex.join(vm_command)
+
+	return (
+		f'cd {shlex.quote(str(context.project_path))} && {run_command}; '
+		'status=$?; '
+		f'printf %s "$status" > {shlex.quote(str(status_path))}; '
+		'exit "$status"'
+	)
+
+
+def write_vm_run_script(context: CommandContext, command: list[str])-> Path:
+	network_commands = [
+		'#!/bin/sh',
+		'ip link set eth0 up',
+		f'ip addr add {VM_PASST_ADDRESS}/24 dev eth0 2>/dev/null || true',
+		f'ip route add default via {VM_PASST_GATEWAY} dev eth0 2>/dev/null || true',
+	]
+	for forward in context.configuration.sandbox_connect_host_ports:
+		network_commands.append(
+			f'socat TCP-LISTEN:{forward.sandbox_port},bind=127.0.0.1,reuseaddr,fork '
+			f'TCP:{VM_PASST_GATEWAY}:{forward.host_port} & true'
+		)
+	status_file = tempfile.NamedTemporaryFile(
+		mode='w',
+		encoding='utf-8',
+		suffix='.status',
+		dir=context.runtime,
+		delete=True,
+	)
+	network_commands.append('exec ' + shlex.join([*setpriv_command(), '/bin/sh', '-lc', vm_shell_command(context, command, str(status_file))]))
+	script_file = tempfile.NamedTemporaryFile(
+		mode='w',
+		encoding='utf-8',
+		suffix='.sh',
+		dir=context.runtime,
+		delete=True,
+	)
+	script_file.write('\n'.join(network_commands) + '\n')
+	script_file.flush()
+	return Path(script_file.name), cast(IO[str], script_file)
+
+
 def command_exec(context: CommandContext):
 	args = context.args
-	command =args.command[1:]
+	command = args.command[1:]
 
 	extra_options = []
 	if args.shared_network:
 		extra_options += ['--share-net']
 
+	vm_run_script = write_vm_run_script(context, command)
+
 	wrapped_args = build_bwrap_args(
-		command,
-		extra_options=extra_options
+		command=command,
+		extra_options=extra_options,
 	)
 
 	if not context.args.shared_network:
@@ -258,8 +347,8 @@ def stringify_env_value(value: object) -> str:
 
 def parse_configuration(agent_config: Path, project_config: Path) -> Configuration:
 	mounts: list[tuple[str, Path, Path]] = []
-	host_connect_sandbox_ports: list[str] = []
-	sandbox_connect_host_ports: list[str] = []
+	host_connect_sandbox_ports: list[NetForward] = []
+	sandbox_connect_host_ports: list[NetForward] = []
 	env: dict[str, str] = {}
 
 	for path in [agent_config, project_config]:
@@ -303,9 +392,9 @@ def parse_configuration(agent_config: Path, project_config: Path) -> Configurati
 			if not 1 <= host_port <= 65535 or not 1 <= sandbox_port <= 65535:
 				raise CommandError(f"invalid network port in rule #{index}")
 			if allow == "host_connect_sandbox":
-				host_connect_sandbox_ports.append(f"{host_port}:{sandbox_port}")
+				host_connect_sandbox_ports.append(NetForward(protocol="tcp", host_port=host_port, sandbox_port=sandbox_port))
 			elif allow == "sandbox_connect_host":
-				sandbox_connect_host_ports.append(f"{sandbox_port}:{host_port}")
+				sandbox_connect_host_ports.append(NetForward(protocol="tcp", host_port=host_port, sandbox_port=sandbox_port))
 			else:
 				raise CommandError(f"invalid network direction in rule #{index}")
 
