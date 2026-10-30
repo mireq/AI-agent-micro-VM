@@ -358,7 +358,12 @@ def write_vm_run_script(context: CommandContext, command: list[str]) -> Path:
 	vm_environment[VM_UID_ENV] = str(os.getuid())
 	vm_environment[VM_GID_ENV] = str(os.getgid())
 	vm_environment[VM_GROUPS_ENV] = ','.join(str(group) for group in os.getgroups())
-	vm_command = ['env', '-i', *[f'{key}={value}' for key, value in vm_environment.items()], *command]
+	vm_command = [
+		*setpriv_command(),
+		'env', '-i',
+		*[f'{key}={value}' for key, value in vm_environment.items()],
+		*command,
+	]
 	network_commands.append(
 		f'cd {shlex.quote(str(context.project_path))}'
 		f' && exec {shlex.join(vm_command)}'
@@ -512,6 +517,7 @@ def build_argument_parser():
 	parser = argparse.ArgumentParser(description="Manage agent workspace")
 	parser.add_argument(
 		'--legacy-workspace',
+		action='store_true',
 		help="Use legacy workspace dir instead of new with slug.",
 	)
 	subparsers = parser.add_subparsers(dest='tool', required=True)
@@ -629,7 +635,7 @@ def update_env(project_path: Path, configuration: Configuration):
 	configuration.env.setdefault('HOME', os.environ.get('HOME', str(Path.home())))
 	configuration.env.setdefault('PATH', os.environ.get('PATH', '/usr/bin:/bin'))
 	configuration.env.setdefault(NESTED_ENV, '1')
-	configuration.env['PATH'] = f'/agent/bin:{configuration.env['PATH']}'
+	configuration.env['PATH'] = '/agent/bin:' + configuration.env['PATH']
 	for name in ("USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM"):
 		if name in os.environ:
 			configuration.env[name] = os.environ[name]
