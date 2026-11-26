@@ -521,9 +521,10 @@ def workspace_data_name(path: Path, legacy: bool) -> str:
 	return workspace_hash(path) if legacy else workspace_slug(path)
 
 
-def runtime_dir(project_path: Path, legacy_workspace: bool) -> Path:
+def runtime_dir(project_path: Path) -> Path:
 	base = Path(os.environ.get('XDG_RUNTIME_DIR', f'/tmp/agent_workspace-{os.getuid()}'))
-	path = Path(tempfile.mkdtemp(prefix=f'{workspace_data_name(project_path, legacy_workspace)}-', dir=base if base.exists() else None))
+	# short name: runtime holds AF_UNIX sockets, path limit is 108 bytes
+	path = Path(tempfile.mkdtemp(prefix=f'aw-{workspace_hash(project_path)[:12]}-', dir=base if base.exists() else None))
 	path.chmod(0o700)
 	return path
 
@@ -674,7 +675,7 @@ def make_context(args: argparse.Namespace) -> CommandContext:
 		check_worktree_name(sub_workspace)
 	configuration = parse_configuration(agent_config, project_config)
 	update_env(project_path, configuration)
-	runtime = runtime_dir(project_path, args.legacy_workspace)
+	runtime = runtime_dir(project_path)
 	return CommandContext(
 		args=args,
 		project_path=project_path,
