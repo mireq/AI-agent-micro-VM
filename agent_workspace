@@ -225,6 +225,7 @@ def build_bwrap_args(
 		bwrap_command.extend(['--groups', groups] if groups else ['--clear-groups'])
 		bwrap_command.append('bwrap')
 
+	workspaces = Path('/agent/workspaces') if os.environ.get(VM_ENV) == '1' else context.project_workspace / 'workspaces'
 	args = [
 		*bwrap_command,
 		'--unshare-all',
@@ -239,8 +240,11 @@ def build_bwrap_args(
 		'--dir', '/agent/bin',
 		'--uid', str(os.getuid()),
 		'--gid', str(os.getgid()),
-		'--bind', str(agent_home()), '/agent/agent-home',
-		'--bind', str(Path('/agent/workspaces') if os.environ.get(VM_ENV) == '1' else context.project_workspace / 'workspaces'), '/agent/workspaces',
+		# minimal agent home for nested runs: configs read-only, only workspaces writable
+		'--ro-bind', str(agent_home() / 'config.toml'), '/agent/agent-home/config.toml',
+		'--ro-bind', str(context.project_workspace / 'config.toml'), f'/agent/agent-home/workdirs/{context.project_workspace.name}/config.toml',
+		'--bind', str(workspaces), f'/agent/agent-home/workdirs/{context.project_workspace.name}/workspaces',
+		'--bind', str(workspaces), '/agent/workspaces',
 		'--ro-bind', str(Path(__file__).resolve()), '/agent/bin/agent_workspace',
 		'--bind', str(context.runtime), '/runtime',
 		'--clearenv',
