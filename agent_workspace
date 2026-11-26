@@ -256,10 +256,10 @@ def build_bwrap_args(
 
 def pasta_port_spec(forward: NetForward, allow: str, vm: bool = False) -> str:
 	# VM mode: pasta has already mappings, so just forwards
+	if allow == 'host_connect_sandbox':
+		return f'127.0.0.1/{forward.host_port}:{forward.host_port if vm else forward.sandbox_port}'
 	if vm:
 		return f'{forward.host_port}:{forward.host_port}'
-	if allow == 'host_connect_sandbox':
-		return f'{forward.host_port}:{forward.sandbox_port}'
 	return f'{forward.sandbox_port}:{forward.host_port}'
 
 
