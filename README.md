@@ -1,277 +1,181 @@
 # AI-agent-micro-VM
 
-Workspace manager for agent processes. `agent_workspace` creates per-project,
-per-branch workspaces under `${AGENT_HOME:-$HOME/.agent}`, then runs commands in
-an isolated `bwrap` environment. It can optionally run the command through
-`chroot_vm`.
+`agent_workspace` runs an AI agent in a sandbox.
+The agent sees your project and little else.
+It can run in a light sandbox or in a micro VM.
+
+Example numbers (`exec -- echo hi`, 4-core laptop):
+
+| Mode | Start and exit |
+| --- | --- |
+| `--shared-network` | 55 ms |
+| default (isolated network) | 80 ms |
+| `--vm --shared-network` | 200 ms |
+| `--vm` | 240 ms |
+
+An idle VM uses about 200 MB of host RAM.
+A long Codex session in a VM used about 1.1 GB.
+The VM sees 4 CPUs and 3.9 GB RAM.
+Memory the VM frees goes back to the host.
 
 ## Requirements
 
-- `bwrap`
-- `fuse-overlayfs`
-- `bindfs`
-- `fusermount3`
-- `pasta`
+Always:
+
 - Python 3.11+
+- `bwrap`
+- `pasta` (from the passt package, for isolated network)
+- `/dev/net/tun`
 
-VM mode additionally needs:
+For `--vm`:
 
-- `chroot_vm`
+- `chroot_vm` on `PATH` (libkrun based)
+- Access to `/dev/kvm`
+- `/usr/bin/passt`
 - `/usr/bin/setpriv`
-- `/dev/kvm`
+- `ip` and `socat` (used inside the VM for port rules)
+- `fuse-overlayfs`, `fusermount3` and `/dev/fuse` (for `--vm --workspace`)
 
-## Layout
+Check that `chroot_vm` works:
 
-Global agent config:
+```bash
+chroot_vm / /bin/echo ok
+```
+
+## Usage
+
+Run commands from your project directory.
+
+```bash
+agent_workspace shell                  # your shell in the sandbox
+agent_workspace exec -- ls -la         # one command
+agent_workspace exec --vm -- ls -la    # one command in a micro VM
+agent_workspace configure              # edit project config
+```
+
+`shell` and `exec` accept these options:
+
+- `--vm`: run in a micro VM.
+- `--shared-network`: use the host network. No network isolation.
+- `--workspace NAME`: work on a copy of the project. See below.
+
+## What the agent sees
+
+- The project directory, writable, at its real path.
+- An empty `/tmp`.
+- Paths you mount in config.
+- `agent_workspace` itself, so the agent can start sub-workspaces.
+
+Everything else is hidden.
+The environment is cleared.
+Only `HOME`, `PATH`, `USER`, `SHELL`, `LANG`, `TERM` and similar basics pass through.
+
+## Workspaces
+
+`--workspace NAME` gives the agent a private copy of the project.
+The agent sees the project as usual.
+Its changes are stored separately.
+Your project files stay untouched.
+
+```bash
+agent_workspace exec --workspace review -- my-agent
+```
+
+Changes land in:
 
 ```text
-${AGENT_HOME:-$HOME/.agent}/config.toml
+~/.agent/workdirs/<project>/workspaces/review/upper/
 ```
 
-Per-project state:
-
-```text
-${AGENT_HOME:-$HOME/.agent}/workdirs/<workdir-hash>/
-```
-
-Each project directory contains:
-
-```text
-config.toml
-.path
-scripts/workspace_post_create
-scripts/workspace_pre_enter
-scripts/workspace_pre_remove
-workspaces/<branch>/
-```
-
-## Basic Usage
-
-Set the current project branch:
-
-```bash
-./agent_workspace branch develop
-```
-
-Edit the current project config:
-
-```bash
-./agent_workspace configure
-```
-
-Run a shell in the current branch workspace:
-
-```bash
-./agent_workspace shell
-```
-
-Run a command in the current branch workspace:
-
-```bash
-./agent_workspace exec -- ls
-```
-
-Run through `chroot_vm`:
-
-```bash
-./agent_workspace exec --vm -- ls
-./agent_workspace shell --vm
-```
-
-Create a subagent workspace and run a command:
-
-```bash
-./agent_workspace subagent reviewer -- my-agent review
-```
-
-List known workspaces:
-
-```bash
-./agent_workspace ls
-./agent_workspace ls -a
-```
-
-Unmount current branch mounts:
-
-```bash
-./agent_workspace umount
-```
-
-Remove current branch workspace:
-
-```bash
-./agent_workspace rm
-./agent_workspace rm --yes
-```
-
-Mount the current branch workspace over the project path with `bindfs`:
-
-```bash
-./agent_workspace activate
-./agent_workspace deactivate
-```
-
-Use another project directory:
-
-```bash
-./agent_workspace --workdir /path/to/project shell
-```
+Names may use letters, digits, `.`, `_` and `-`.
 
 ## Configuration
 
-`agent_workspace` creates a default global config at:
+Two config files are merged.
+The global file comes first, the project file second.
 
 ```text
-${AGENT_HOME:-$HOME/.agent}/config.toml
+~/.agent/config.toml                       # global
+~/.agent/workdirs/<project>/config.toml    # project
 ```
 
-The project config starts as:
+`<project>` is the project path with dashes plus a short hash.
+For example: `~-src-myapp-1a2b3c4d`.
 
-```toml
-branch = "main"
-```
+The global file is created on first run.
+It mounts system directories read-only.
+The project file starts empty.
 
-Set the branch without opening an editor:
+Set `AGENT_HOME` to use another directory than `~/.agent`.
 
-```bash
-./agent_workspace configure branch develop
-./agent_workspace branch develop
-```
-
-`AGENT_BRANCH` overrides the configured branch for the current process.
-
-## Mounts
-
-Mounts are configured with `[[mount]]` entries in TOML:
+### Mounts
 
 ```toml
 [[mount]]
-flag = "r"
+flag = "r"          # read-only
 src = "/usr"
 dst = "/usr"
 
 [[mount]]
-flag = "w"
-src = "/home/user/.codex"
-dst = "/home/user/.codex"
+flag = "w"          # writable
+src = "/home/user/.agent/npm"
+dst = "/home/user/.npm"
 
 [[mount]]
-flag = "o"
-src = "/path/to/source"
-dst = "/path/in/sandbox"
+flag = "o"          # writable, changes vanish on exit
+src = "/home/user/.gitconfig.d"
+dst = "/home/user/.gitconfig.d"
 ```
 
-Flags:
+Paths must be absolute.
+Inside a read-only mount, like `/opt`, the destination must already exist.
+Missing source paths are skipped.
 
-- `r`: read-only bind
-- `w`: read-write bind
-- `o`: overlay using `fuse-overlayfs`
-
-The project workdir is mounted as an overlay by default.
-
-Global mounts from `$AGENT_HOME/config.toml` are combined with project mounts
-from `workdirs/<hash>/config.toml`.
-
-See [example_dot_agent/config.toml](example_dot_agent/config.toml).
-
-## Activation
-
-`activate` prepares the configured branch workspace, then mounts it with
-`bindfs`:
-
-```text
-${AGENT_HOME:-$HOME/.agent}/workdirs/<workdir-hash>/workspaces/<branch>/root/<project-path>
-```
-
-over the original project path. This lets host tools such as editors keep using
-normal project paths while seeing the same workspace files as the agent.
-
-`deactivate` checks `/proc/self/mountinfo` and only unmounts the project path
-with `fusermount3` when the top mount matches a workspace branch for this
-project.
-
-## Environment
-
-Add environment variables with an `[env]` table:
+### Environment
 
 ```toml
 [env]
 NPM_CONFIG_USERCONFIG = "/home/user/.npmrc"
-CI = true
+CI = true           # becomes "1"
 ```
 
-`[env]` from the global config is loaded first. `[env]` from the project config
-overrides global values.
+Values may be strings, numbers or booleans.
+Project values override global values.
 
-`AGENT_BRANCH` is set inside `shell`, `exec`, and `cd` only when a real branch
-is selected. No-branch mode leaves it unset for the command environment.
+### Network
 
-## Network
+By default the network is isolated:
 
-Network isolation is enabled by default for `shell`, `exec`, and `subagent`.
+- Internet works.
+- The agent cannot reach the host. Not localhost, not the host's LAN address.
+- The host cannot reach the agent.
 
-Use host networking:
-
-```bash
-./agent_workspace shell --shared-network
-./agent_workspace exec --shared-network -- curl https://example.com/
-```
-
-Allowed port mappings are configured in project `config.toml`:
+Open single TCP ports in the project config:
 
 ```toml
+# Agent connects to 127.0.0.1:3306, reaches host 127.0.0.1:3306.
 [[net]]
 allow = "sandbox_connect_host"
 host_port = 3306
 sandbox_port = 3306
 
+# Host connects to 127.0.0.1:8080, reaches agent port 80.
 [[net]]
 allow = "host_connect_sandbox"
 host_port = 8080
 sandbox_port = 80
 ```
 
-Rules:
-
-- `sandbox_connect_host`: sandbox connects to a selected host localhost port
-- `host_connect_sandbox`: host connects to a selected sandbox localhost port
-
+Each rule opens one port in one direction.
+All other ports stay closed, both ways.
+Forwarded ports listen on host `127.0.0.1` only. Your LAN cannot reach them.
+This works the same with and without `--vm`.
 Only TCP is supported.
 
-VM mode uses `passt` for isolated networking so configured
-`host_connect_sandbox` port mappings also expose services running inside the VM.
+## Example: Codex in a VM
 
-Print network setup details:
-
-```bash
-./agent_workspace shell --verbose
-```
-
-## Workspace Hooks
-
-These executable scripts are created for every project if missing:
-
-```text
-scripts/workspace_post_create
-scripts/workspace_pre_enter
-scripts/workspace_pre_remove
-```
-
-`workspace_post_create` and `workspace_pre_remove` receive:
-
-```text
-AGENT_BRANCH
-AGENT_WORKSPACE_DIR
-```
-
-`workspace_pre_enter` receives the same environment and is also called with the
-workspace path and branch as positional arguments for compatibility.
-
-## Example `codex-acp` Setup
-
-Install `codex-acp` under `~/.npm/bin/codex-acp`.
-
-Create agent config from the example:
+Install `codex-acp` into `~/.npm/bin/codex-acp`.
+Copy the example config:
 
 ```bash
 mkdir -p ~/.agent
@@ -279,42 +183,18 @@ cp example_dot_agent/config.toml ~/.agent/config.toml
 cp example_dot_agent/npmrc ~/.agent/npmrc
 ```
 
-Edit `~/.agent/config.toml` and replace `/home/user` with your home directory.
-
-Run the wrapper:
-
-```bash
-./example-codex-acp_vm --help
-```
-
-Wrapper contents:
+Replace `/home/user` with your home directory in `~/.agent/config.toml`.
+Then run [example-codex-acp_vm](example-codex-acp_vm):
 
 ```bash
-NODE_PATH="$HOME/.npm"
-agent_workspace exec --vm -- "$NODE_PATH/bin/codex-acp" "$@"
+agent_workspace exec --vm -- "$HOME/.npm/bin/codex-acp" "$@"
 ```
 
-Neovim ACP sample:
-[example_agentic_nvim_config.lua](example_agentic_nvim_config.lua)
+Neovim sample: [example_agentic_nvim_config.lua](example_agentic_nvim_config.lua).
 
-## Logs
+## Security notes
 
-VM mode writes one log file per run to:
-
-```text
-${AGENT_VM_LOG_DIR:-$PWD/.agent_vm}/<timestamp-and-pid>.krun.log
-```
-
-`AGENT_VM_LOG_BASENAME` can override the generated log basename.
-`AGENT_VM_LOG_DIR` must resolve inside the project workdir so the log path is
-visible to `chroot_vm` from inside the bwrap environment.
-In isolated VM mode, `AGENT_VM_PASST_BIN_DIR` can override the generated
-`passt` wrapper directory. The directory must also resolve inside the project
-workdir.
-
-## Security Notes
-
-- Default networking is isolated.
-- `--shared-network` intentionally removes the network boundary.
-- Any `w` mount is writable by the sandboxed process.
-- VM mode exposes `/dev/kvm` to bwrap, but does not bind the whole host `/dev`.
+- `--shared-network` removes the network boundary.
+- A forwarded port gives the agent full access to that service.
+- `w` mounts are writable by the agent.
+- The agent sees its configs read-only. It cannot change its own mounts or ports.
