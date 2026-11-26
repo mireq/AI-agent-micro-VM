@@ -349,17 +349,21 @@ def write_vm_run_script(context: CommandContext, command: list[str]) -> Path:
 	passt = context.runtime / 'passt'
 	passt.write_text('#!/bin/sh\nexec ' + shlex.join(passt_command(context)) + ' "$@"\n', encoding='utf-8')
 	passt.chmod(0o700)
-	network_commands = [
+	setup_commands = [
 		'#!/bin/sh',
+		'echo 2 > /sys/module/page_reporting/parameters/page_reporting_order',
 		'ip link set eth0 up 2>/dev/null || true',
 		f'ip addr add {VM_PASST_ADDRESS}/24 dev eth0 2>/dev/null || true',
 		f'ip route add default via {VM_PASST_GATEWAY} dev eth0 2>/dev/null || true',
 	]
 	for forward in context.configuration.sandbox_connect_host_ports:
-		network_commands.append(
+		setup_commands.append(
 			f'socat TCP-LISTEN:{forward.sandbox_port},bind=127.0.0.1,reuseaddr,fork '
 			f'TCP:{VM_PASST_GATEWAY}:{forward.host_port} & true'
 		)
+	setup_commands.append(
+		'(while sleep 60; do echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; done) >/dev/null 2>&1 & true'
+	)
 	vm_environment = dict(context.configuration.env)
 	vm_environment['AGENT_HOME'] = '/agent/agent-home'
 	vm_environment['AGENT_WORKSPACE_COMMAND'] = '/agent/bin/agent_workspace'
@@ -373,12 +377,12 @@ def write_vm_run_script(context: CommandContext, command: list[str]) -> Path:
 		*[f'{key}={value}' for key, value in vm_environment.items()],
 		*command,
 	]
-	network_commands.append(
+	setup_commands.append(
 		f'cd {shlex.quote(str(context.project_path))}'
 		f' && exec {shlex.join(vm_command)}'
 	)
 	script_file = context.runtime / 'vm.sh'
-	script_file.write_text('\n'.join(network_commands) + '\n', encoding='utf-8')
+	script_file.write_text('\n'.join(setup_commands) + '\n', encoding='utf-8')
 	script_file.chmod(0o700)
 	return script_file
 
