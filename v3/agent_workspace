@@ -227,7 +227,7 @@ def build_bwrap_args(
 	args = [
 		*bwrap_command,
 		'--unshare-all',
-		*(['--share-net'] if vm or context.args.shared_network else []),
+		'--share-net',
 		'--die-with-parent',
 		'--proc', '/proc',
 		'--dev', '/dev',
@@ -236,6 +236,8 @@ def build_bwrap_args(
 		*bwrap_mount_args,
 		'--dir', '/agent',
 		'--dir', '/agent/bin',
+		'--uid', str(os.getuid()),
+		'--gid', str(os.getgid()),
 		'--bind', str(agent_home()), '/agent/agent-home',
 		'--bind', str(Path('/agent/workspaces') if os.environ.get(VM_ENV) == '1' else context.project_workspace / 'workspaces'), '/agent/workspaces',
 		'--ro-bind', str(Path(__file__).resolve()), '/agent/bin/agent_workspace',
@@ -251,25 +253,28 @@ def build_bwrap_args(
 	return args
 
 
-def pasta_port_spec(forward: NetForward, allow: str) -> str:
+def pasta_port_spec(forward: NetForward, allow: str, vm: bool = False) -> str:
+	# VM mode: pasta has already mappings, so just forwards
+	if vm:
+		return f'{forward.host_port}:{forward.host_port}'
 	if allow == 'host_connect_sandbox':
 		return f'{forward.host_port}:{forward.sandbox_port}'
 	return f'{forward.sandbox_port}:{forward.host_port}'
 
 
-def build_pasta_args(bwrap_command: list[str], context: CommandContext, host_loopback_to_namespace_loopback: bool = True):
+def build_pasta_args(bwrap_command: list[str], context: CommandContext, host_loopback_to_namespace_loopback: bool = True, vm: bool = False):
 	forwards = []
 	configuration = context.configuration
 
 	if configuration.host_connect_sandbox_ports:
 		for forward in configuration.host_connect_sandbox_ports:
-			forwards.extend(['--tcp-ports', pasta_port_spec(forward, 'host_connect_sandbox')])
+			forwards.extend(['--tcp-ports', pasta_port_spec(forward, 'host_connect_sandbox', vm)])
 	else:
 		forwards.extend(['--tcp-ports', 'none'])
 
 	if configuration.sandbox_connect_host_ports:
 		for forward in configuration.sandbox_connect_host_ports:
-			forwards.extend(['--tcp-ns', pasta_port_spec(forward, 'sandbox_connect_host')])
+			forwards.extend(['--tcp-ns', pasta_port_spec(forward, 'sandbox_connect_host', vm)])
 	else:
 		forwards.extend(['--tcp-ns', 'none'])
 
@@ -321,8 +326,11 @@ def passt_command(context: CommandContext) -> list[str]:
 		'--netmask', VM_PASST_NETMASK, '--gateway', VM_PASST_GATEWAY,
 		'--ipv4-only', '--udp-ports', 'none',
 	]
+	# passt maps gateway to host loopback by default, disable unless host ports are requested
 	if context.configuration.sandbox_connect_host_ports:
 		command.extend(['--map-host-loopback', VM_PASST_GATEWAY])
+	else:
+		command.append('--no-map-gw')
 	for forward in context.configuration.host_connect_sandbox_ports:
 		command.extend(['--tcp-ports', f'127.0.0.1/{forward.host_port}:{forward.sandbox_port}'])
 	if not context.configuration.host_connect_sandbox_ports:
@@ -451,6 +459,8 @@ def _run_command(context: CommandContext, command: list[str]):
 			'--log=/runtime/vm.log', '/', '/bin/sh', '/runtime/vm.sh',
 		]
 		wrapped_args = build_bwrap_args(context, vm_command, vm=True)
+		if not context.args.shared_network and os.environ.get(VM_ENV) != '1':
+			wrapped_args = build_pasta_args(wrapped_args, context=context, vm=True)
 		return subprocess.call(wrapped_args)
 
 	wrapped_args = build_bwrap_args(context, command)
