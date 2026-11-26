@@ -170,6 +170,17 @@ def build_bwrap_args(
 			dev_args.extend(['--dev-bind', str(fuse_path), str(fuse_path)])
 
 	bwrap_mount_args = []
+
+	if context.sub_workspace is None:
+		bwrap_mount_args.extend(["--bind", str(context.project_path), str(context.project_path)])
+	elif context.workspace_root is not None:
+		bwrap_mount_args.extend(["--bind", str(context.workspace_root), str(context.project_path)])
+	else:
+		bwrap_mount_args.extend([
+			"--overlay-src", str(context.project_path),
+			'--overlay', str(context.project_workspace / 'workspaces' / context.sub_workspace / 'upper'), str(context.project_workspace / 'workspaces' / context.sub_workspace / 'work'), str(context.project_path),
+		])
+
 	for mnt in context.configuration.mounts:
 		flag, src, dst = mnt
 		if os.environ.get(VM_ENV) == '1':
@@ -188,16 +199,6 @@ def build_bwrap_args(
 		for path in (Path('/usr'), Path('/bin'), Path('/lib'), Path('/lib64'), Path('/opt'), Path('/etc')):
 			if path.exists():
 				bwrap_mount_args.extend(['--ro-bind-try', str(path), str(path)])
-
-	if context.sub_workspace is None:
-		bwrap_mount_args.extend(["--bind", str(context.project_path), str(context.project_path)])
-	elif context.workspace_root is not None:
-		bwrap_mount_args.extend(["--bind", str(context.workspace_root), str(context.project_path)])
-	else:
-		bwrap_mount_args.extend([
-			"--overlay-src", str(context.project_path),
-			'--overlay', str(context.project_workspace / 'workspaces' / context.sub_workspace / 'upper'), str(context.project_workspace / 'workspaces' / context.sub_workspace / 'work'), str(context.project_path),
-		])
 
 	bwrap_env_args = []
 	for key, value in context.configuration.env.items():
