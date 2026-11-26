@@ -192,7 +192,7 @@ def build_bwrap_args(
 		elif flag == 'w':
 			bwrap_mount_args.extend(['--bind', str(src), str(dst)])
 		elif flag == 'o':
-			bwrap_mount_args.extend(['--overlay-src', str(src), str(dst)])
+			bwrap_mount_args.extend(['--overlay-src', str(src), '--tmp-overlay', str(dst)])
 		else:
 			raise CommandError(f"invalid mount flag: {flag}", return_code=1)
 	if os.environ.get(VM_ENV) == '1':
